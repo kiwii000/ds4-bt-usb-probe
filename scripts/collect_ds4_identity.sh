@@ -32,6 +32,7 @@ mkdir -p \
   "$BASE_DIR/input/event-sysfs" \
   "$BASE_DIR/hidraw/hidraw-udev" \
   "$BASE_DIR/hidraw/report-descriptors" \
+  "$BASE_DIR/feature_reports" \
   "$BASE_DIR/identity" \
   "$BASE_DIR/logs" \
   "$BASE_DIR/evtest"
@@ -83,6 +84,20 @@ run_shell_to_file() {
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+find_probe_binary() {
+  local candidate
+  for candidate in "$ROOT_DIR/ds4-bt-usb-probe" "$ROOT_DIR/target/release/ds4-bt-usb-probe"; do
+    if [ -f "$candidate" ]; then
+      chmod +x "$candidate" 2>/dev/null || true
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 hex_to_prefixed() {
@@ -267,6 +282,22 @@ for hidraw_dev in /dev/hidraw*; do
     echo "$hidraw_dev -> $sys" | tee -a "$BASE_DIR/identity/hidraw_matches.txt"
     record_identity_from_hidraw "$sys"
 
+    if [ "$MODE" = "usb" ]; then
+      probe_bin="$(find_probe_binary || true)"
+      if [ -n "$probe_bin" ]; then
+        echo "[collect] capturing USB DS4 feature reports from $hidraw_dev"
+        "$probe_bin" capture-features \
+          --hidraw "$hidraw_dev" \
+          --output-dir "$BASE_DIR/feature_reports" \
+          >"$BASE_DIR/feature_reports/$hidraw_base-capture.log" 2>&1 || {
+            echo "[collect] WARNING: feature report capture failed for $hidraw_dev"
+            cat "$BASE_DIR/feature_reports/$hidraw_base-capture.log" || true
+          }
+      else
+        echo "[collect] WARNING: probe binary unavailable; USB feature reports were not captured"
+      fi
+    fi
+
     if [ -r "$sys/report_descriptor" ]; then
       desc_bin="$BASE_DIR/hidraw/report-descriptors/$hidraw_base-report_descriptor.bin"
       desc_hex="$BASE_DIR/hidraw/report-descriptors/$hidraw_base-report_descriptor.hex"
@@ -303,6 +334,15 @@ done
     echo "descriptor=$first_descriptor"
   else
     echo "descriptor=not captured"
+  fi
+  if [ "$MODE" = "usb" ]; then
+    for report_id in 0x02 0x12 0xa3; do
+      if [ -s "$BASE_DIR/feature_reports/$report_id.bin" ]; then
+        echo "feature_$report_id=captured"
+      else
+        echo "feature_$report_id=not captured"
+      fi
+    done
   fi
 } >"$BASE_DIR/identity/summary.txt"
 

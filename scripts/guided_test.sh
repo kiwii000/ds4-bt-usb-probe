@@ -40,6 +40,19 @@ PROBE_LOG="$RUN_DIR/probe.log"
 PROBE_PID=""
 
 mkdir -p "$RUN_DIR"
+cat >"$RUN_DIR/expected_virtual_identity.txt" <<'EOF'
+Expected virtual Proton-visible identity:
+HID_ID=0003:0000054C:000009CC
+HID_NAME=Sony Interactive Entertainment Wireless Controller
+bus_type=1
+version=0x0100 when captured/default identity permits
+input_report=0x01, 64-byte USB-style DS4
+
+Physical Bluetooth comparison:
+HID_ID=0005:0000054C:000009CC
+bus_type=2
+input_report=0x11, 78-byte Bluetooth DS4
+EOF
 exec > >(tee -a "$GUIDED_LOG") 2>&1
 
 stop_probe() {
@@ -102,26 +115,28 @@ start_probe() {
   echo "Step 3:"
   echo "[guided] Starting UHID probe in the background"
 
-  "$ROOT_DIR/scripts/run_probe.sh" >"$PROBE_LOG" 2>&1 &
+  DS4_RAW_CAPTURE_DIR="$RUN_DIR/raw_bluetooth_reports" \
+    "$ROOT_DIR/scripts/run_probe.sh" --bridge >"$PROBE_LOG" 2>&1 &
   PROBE_PID=$!
 
   echo "$PROBE_PID" >"$RUN_DIR/probe.pid"
   echo "[guided] Probe PID: $PROBE_PID"
   echo "[guided] Probe output: $PROBE_LOG"
   local attempt
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
       probe_start_failed "probe process exited early"
       return 1
     fi
-    if grep -Eq '/dev/uhid opened|sending neutral USB-style DS4 input reports' "$PROBE_LOG"; then
+    if grep -Fq '[probe] READY: virtual DS4 initialized' "$PROBE_LOG" &&
+      grep -Fq '[bridge] READY: Bluetooth input stream opened' "$PROBE_LOG"; then
       echo "[guided] Probe startup confirmed."
       return 0
     fi
     sleep 1
   done
 
-  probe_start_failed "probe initialization was not confirmed after 10 seconds"
+  probe_start_failed "virtual DS4 and Bluetooth bridge readiness were not confirmed after 20 seconds"
   return 1
 }
 
@@ -138,14 +153,24 @@ probe_start_failed() {
   finish_archive
 }
 
-ask_diablo_result() {
+ensure_probe_alive() {
+  if [ -n "$PROBE_PID" ] && kill -0 "$PROBE_PID" >/dev/null 2>&1; then
+    return 0
+  fi
+  probe_start_failed "probe or Bluetooth bridge exited during the Diablo IV test"
+  return 1
+}
+
+ask_result() {
+  local prompt="$1"
+  local output="$2"
   local answer=""
   echo
   while true; do
-    read -r -p "Did Diablo IV show PlayStation glyphs? yes/no/unsure: " answer
+    read -r -p "$prompt yes/no/unsure: " answer
     case "${answer,,}" in
       yes|no|unsure)
-        printf '%s\n' "${answer,,}" >"$RUN_DIR/diablo_test_result.txt"
+        printf '%s\n' "${answer,,}" >"$RUN_DIR/$output"
         return 0
         ;;
       *)
@@ -188,7 +213,14 @@ echo "Step 4:"
 echo "Now launch Steam, make sure Steam Input is disabled for Diablo IV, launch Diablo IV, and check whether PlayStation glyphs appear."
 pause_for_enter "Press Enter after you have checked Diablo IV."
 
-ask_diablo_result
+if ! ensure_probe_alive; then
+  exit 1
+fi
+
+ask_result "Did Diablo IV detect a controller?" "diablo_controller_detected.txt"
+ask_result "Did PlayStation glyphs appear?" "diablo_playstation_glyphs.txt"
+ask_result "Did input work?" "diablo_input_worked.txt"
+ask_result "Was there duplicate input?" "diablo_duplicate_input.txt"
 
 stop_probe
 copy_summaries

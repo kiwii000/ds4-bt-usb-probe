@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN=""
+BRIDGE=0
+if [ "${1:-}" = "--bridge" ]; then
+  BRIDGE=1
+  shift
+fi
 
 echo "[run_probe] root=$ROOT_DIR"
 
@@ -103,6 +108,26 @@ else
   echo "[run_probe] WARNING: run sudo ./scripts/collect_ds4_identity.sh usb first for the preferred real-controller descriptor"
 fi
 
+feature_root=""
+if [ -d "$ROOT_DIR/captures" ]; then
+  feature_root="$(
+    find "$ROOT_DIR/captures" -path '*/usb/feature_reports' -type d -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr \
+      | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print; exit }'
+  )"
+fi
+if [ -n "$feature_root" ]; then
+  echo "[run_probe] using captured feature reports: $feature_root"
+  args+=(--feature-root "$feature_root")
+else
+  echo "[run_probe] WARNING: no captured USB feature reports found; synthetic fallbacks will be used"
+fi
+
 echo "[run_probe] launching probe. Keep this terminal open during the Diablo IV test."
 echo "[run_probe] probe effective user: $(id -u) (must be 0/root)"
+if [ "$BRIDGE" -eq 1 ]; then
+  raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"
+  bridge_args=(bridge "${args[@]}" --raw-capture-dir "$raw_capture_dir")
+  exec "$BIN" "${bridge_args[@]}"
+fi
 exec "$BIN" "${args[@]}"

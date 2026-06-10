@@ -2,7 +2,7 @@
 
 ## Path A: GitHub Actions Artifact Preferred
 
-After GitHub Actions passes, download the artifact named:
+Download the latest green GitHub Actions artifact named:
 
 ```text
 ds4-bt-usb-probe-linux-x86_64
@@ -39,6 +39,8 @@ The preferred file to send back is:
 ```text
 ds4-probe-results-<timestamp>.tar.gz
 ```
+
+Version 0.2 is a first functional bridge attempt. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
 
 The tester may also try the optional KDE/Bazzite desktop launcher:
 
