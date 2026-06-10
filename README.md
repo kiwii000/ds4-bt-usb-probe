@@ -1,10 +1,10 @@
 # ds4-bt-usb-probe
 
-`ds4-bt-usb-probe` v0.3 is an unconfirmed functional Linux attempt to make a Bluetooth DS4-compatible controller usable by Diablo IV as a USB-style PlayStation controller.
+`ds4-bt-usb-probe` v0.4 is an unconfirmed functional Linux attempt to make a Bluetooth DS4-compatible controller usable by Diablo IV as a USB-style PlayStation controller.
 
-> Will Diablo IV / Proton accept the preserved UHID Sony identity plus a USB-identified uinput gamepad path?
+> Will Diablo IV / Proton select the preserved virtual USB-style DS4/uinput outputs if the original physical Bluetooth DS4 is temporarily hidden from the Steam user?
 
-It preserves the Sony-identifying UHID path used by Steam and adds a required uinput evdev gamepad fallback for Diablo IV. It does **not** implement the final daemon/service, rumble, gyro/touchpad forwarding, remapping, macros, profiles, Xbox/XInput, duplicate suppression, or autostart.
+It preserves the Sony-identifying UHID path, keeps the required uinput evdev gamepad fallback, and adds ACL-only isolation for the physical Bluetooth controller during the guided test. It does **not** implement the final daemon/service, rumble, gyro/touchpad forwarding, remapping, macros, profiles, Xbox/XInput, duplicate suppression, or autostart.
 
 Target test machine:
 
@@ -28,7 +28,7 @@ bus_type=1
 USB-style input report 0x01
 ```
 
-The rejected Bluetooth mode appears as `HID_ID=0005:0000054C:000009CC`, `bus_type=2`, with full `0x11` / 78-byte Bluetooth reports. v0.3 keeps the working USB-visible UHID identity and adds a BUS_USB uinput event device because Proton previously marked the UHID hidraw path as `input=-1` / `is_gamepad=0`.
+The rejected Bluetooth mode appears as `HID_ID=0005:0000054C:000009CC`, `bus_type=2`, with full `0x11` / 78-byte Bluetooth reports. v0.4 keeps the working USB-visible UHID identity, keeps the BUS_USB uinput event device, and temporarily revokes the normal Steam user's ACL access to the original physical Bluetooth DS4 nodes after the bridge opens the physical hidraw input.
 
 UHID cannot create a real physical USB topology. This test still determines whether its USB bus identity and HID behavior are sufficient for Proton/Diablo IV.
 
@@ -56,6 +56,7 @@ UHID cannot create a real physical USB topology. This test still determines whet
 - In guided bridge mode, forwards basic controls from full `0x11` / 78-byte and minimal `0x01` / 10-byte Bluetooth reports.
 - Emits the same basic controls to a uinput evdev gamepad with normal axes, hats, buttons, and `EV_SYN`.
 - Uses captured USB and input-event versions when available; otherwise UHID falls back to `0x0100` and uinput to `0x8111`.
+- In the default guided test, uses ACL-only isolation to hide physical Bluetooth DS4 hidraw/input/js nodes from the normal Steam user while leaving virtual UHID/uinput nodes alone.
 
 The fallback descriptor is only a backup. Because the controller may be PS4-compatible rather than original Sony, the USB descriptor captured from the real working USB mode is the preferred test input.
 
@@ -76,7 +77,7 @@ target/release/ds4-bt-usb-probe
 
 ## Recommended guided test
 
-This is the easiest path for a remote tester. The script asks when to plug in USB, when to switch to Bluetooth, when to test Diablo IV, and then creates one results archive to send back.
+This is the easiest path for a remote tester. The script asks when to plug in USB, when to switch to Bluetooth, when to launch Steam/Diablo IV, and then creates one results archive to send back.
 
 Download the latest green Actions artifact, extract it on the Bazzite host, not distrobox/toolbox, then run `sudo ./scripts/guided_test.sh`.
 
@@ -89,6 +90,8 @@ chmod +x scripts/*.sh
 sudo ./scripts/guided_test.sh
 ```
 
+Close Steam before starting. The guided script will tell the tester when to launch Steam again after the bridge and physical Bluetooth isolation are confirmed.
+
 If the script reports that `/dev/uhid` is missing or inaccessible, try:
 
 ```bash
@@ -96,7 +99,7 @@ sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
-The guided script attempts `modprobe uinput` automatically when the required uinput node is absent.
+The guided script attempts `modprobe uinput` automatically when the required uinput node is absent. It also requires `getfacl` and `setfacl`; v0.4 does not use a chmod fallback for physical-device isolation.
 
 The script creates:
 
@@ -106,12 +109,14 @@ ds4-probe-results-<timestamp>.tar.gz
 
 Send that archive back after the test.
 
-The guided test will stop and create a diagnostic archive instead of asking for a Diablo IV test unless UHID initializes, a uinput event node is created, and Bluetooth reports are read and forwarded to both outputs.
+The guided test will stop and create a diagnostic archive instead of asking for a Diablo IV test unless UHID initializes, a uinput event node is created, Bluetooth reports are read and forwarded to both outputs, and the physical Bluetooth DS4 nodes are isolated from the Steam user.
 
-If uinput fails, the script prints:
+If physical Bluetooth isolation fails, v0.4 stops before Diablo IV and records `v0.4_valid_diablo_test=no` in the archive.
 
-```text
-uinput fallback failed, so this v0.3 Diablo test is not valid yet. Send back the archive.
+Emergency permission restore:
+
+```bash
+sudo ./scripts/restore_device_permissions.sh
 ```
 
 Optional KDE/Bazzite desktop launcher:
@@ -130,64 +135,18 @@ Run these commands from a normal Bazzite host terminal, not distrobox/toolbox:
 
 ```bash
 chmod +x scripts/*.sh
-sudo ./scripts/collect_ds4_identity.sh usb
-sudo ./scripts/collect_ds4_identity.sh bluetooth
-sudo ./scripts/run_probe.sh --bridge
+sudo ./scripts/guided_test.sh
 ```
 
-Then:
-
-- Launch Steam.
-- Make sure Steam Input is disabled for Diablo IV.
-- Launch Diablo IV.
-- Check whether PlayStation glyphs appear.
-- Send back the full `captures/` folder and terminal output.
-
-Keep `sudo ./scripts/run_probe.sh --bridge` running while testing Diablo IV. Press Ctrl+C after the test.
+The guided script handles USB capture, Bluetooth capture, bridge startup, ACL isolation, Diablo prompts, permission restore, and archive creation.
 
 ## Remote Tester Instructions
 
-1. Connect the controller by USB.
+Use the recommended guided test above. The script will prompt for USB connection, Bluetooth connection, Steam launch, Diablo IV testing, and result answers. Send back the generated archive:
 
-2. Run:
-
-   ```bash
-   sudo ./scripts/collect_ds4_identity.sh usb
-   ```
-
-3. Disconnect USB.
-
-4. Connect the controller by Bluetooth.
-
-5. Run:
-
-   ```bash
-   sudo ./scripts/collect_ds4_identity.sh bluetooth
-   ```
-
-6. Run:
-
-   ```bash
-   sudo ./scripts/run_probe.sh --bridge
-   ```
-
-7. Launch Steam.
-
-8. Make sure Steam Input is disabled for Diablo IV.
-
-9. Launch Diablo IV.
-
-10. Check whether PlayStation glyphs appear.
-
-11. Send back:
-
-   - the full `captures/` folder
-   - the terminal output from all commands
-   - whether Diablo IV showed PlayStation glyphs
-   - whether duplicate inputs happened
-   - whether the real Bluetooth controller was also seen by the game
-
-Keep `sudo ./scripts/run_probe.sh --bridge` running while testing Diablo IV. Press Ctrl+C after the test.
+```text
+ds4-probe-results-<timestamp>.tar.gz
+```
 
 ## Capture Output
 
@@ -225,6 +184,11 @@ Important files include:
 - `guided/bridge_status.txt`
 - `guided/result_summary.txt`
 - `guided/proton_visibility_notes.txt`
+- `guided/device_permissions/manifest.tsv`
+- `guided/device_permissions/discovered_physical_bt_nodes.tsv`
+- `guided/device_permissions/restricted_nodes.tsv`
+- `guided/device_permissions/isolation.log`
+- `guided/device_permissions/restore.log`
 
 If `report_descriptor.bin` exists under the USB capture, `run_probe.sh` will use it automatically. If not, the probe will print a warning and use the built-in fallback descriptor.
 
@@ -295,16 +259,16 @@ During the Diablo IV test, record:
 
 ## Decision Rule
 
-If Diablo IV detects the v0.3 bridge and shows PlayStation glyphs:
+If Diablo IV detects the v0.4 bridge and shows PlayStation glyphs:
 
-- Treat the v0.3 UHID + uinput functional attempt as a successful gate result.
+- Treat the v0.4 physical Bluetooth isolation attempt as a successful gate result.
 - Then add duplicate input suppression.
 - Then add service/autostart.
 
 If Diablo IV does not show PlayStation glyphs:
 
 - Stop.
-- Report that the v0.3 UHID + uinput attempt was insufficient.
+- Report that the v0.4 isolated UHID + uinput attempt was insufficient.
 - Investigate whether Proton/SDL/Diablo is checking deeper sysfs USB topology, SDL mappings, hidraw path, Wine device exposure, or another layer.
 
 Do not claim Diablo IV compatibility until the remote tester confirms the result on the actual target machine.

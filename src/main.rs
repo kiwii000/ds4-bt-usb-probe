@@ -270,7 +270,7 @@ mod linux {
         let uinput_version_source =
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
-        status.set("probe_version", "0.3.0");
+        status.set("probe_version", "0.4.0");
         status.set("output_mode", config.output_mode.as_str());
         status.set("uhid_ready", "false");
         status.set("uinput_required", (config.output_mode == OutputMode::Both).to_string());
@@ -1732,7 +1732,7 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.3
+            "ds4-bt-usb-probe 0.4
 
 Commands:
   ds4-bt-usb-probe [options]
