@@ -1,0 +1,55 @@
+# Release Package
+
+## Path A: GitHub Actions Artifact Preferred
+
+After GitHub Actions passes, download the artifact named:
+
+```text
+ds4-bt-usb-probe-linux-x86_64
+```
+
+Send that extracted folder to the remote tester. It contains:
+
+- compiled `ds4-bt-usb-probe` binary
+- `scripts/`
+- `README.md`
+- `RELEASE_PACKAGE.md`
+
+On the Linux test machine, from inside the extracted artifact folder:
+
+```bash
+chmod +x ds4-bt-usb-probe scripts/*.sh
+sudo ./scripts/collect_ds4_identity.sh usb
+sudo ./scripts/collect_ds4_identity.sh bluetooth
+sudo ./scripts/run_probe.sh
+```
+
+Then follow the `Friend test instructions` section in `README.md`.
+
+## Path B: Build From Source Fallback
+
+If the GitHub Actions artifact is not available, send this project folder to the remote tester with these files included:
+
+- `Cargo.toml`
+- `src/`
+- `scripts/`
+- `README.md`
+- `RELEASE_PACKAGE.md`
+- `.github/workflows/ci.yml`
+- `captures/.gitkeep`
+
+Do not include:
+
+- `target/`
+- old real capture folders unless you intentionally want to share them
+- unrelated local files
+
+Example package command from the project root:
+
+```bash
+tar --exclude='./target' --exclude='./.git' \
+  -czf ds4-bt-usb-probe.tar.gz \
+  Cargo.toml src scripts README.md RELEASE_PACKAGE.md .github captures/.gitkeep
+```
+
+The remote tester should unpack the source package on the Linux target machine, run `chmod +x scripts/*.sh`, build with `./scripts/build_release.sh`, then follow the `Friend test instructions` section in `README.md`.

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Stage Linux x86_64 test artifact
+        run: |
+          mkdir -p ds4-bt-usb-probe-linux-x86_64
+          cp target/release/ds4-bt-usb-probe ds4-bt-usb-probe-linux-x86_64/
+          cp -R scripts ds4-bt-usb-probe-linux-x86_64/
+          cp README.md RELEASE_PACKAGE.md ds4-bt-usb-probe-linux-x86_64/
+
+      - name: Upload Linux x86_64 test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds4-bt-usb-probe-linux-x86_64
+          path: ds4-bt-usb-probe-linux-x86_64
