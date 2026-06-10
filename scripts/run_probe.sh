@@ -2,9 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-BIN="$ROOT_DIR/target/release/ds4-bt-usb-probe"
+BIN=""
 
 echo "[run_probe] root=$ROOT_DIR"
+
+if [ -e /run/.containerenv ] || [ -e /.dockerenv ] || [ -n "${DISTROBOX_ENTER_PATH:-}" ] || [ -n "${CONTAINER_ID:-}" ] || [ -n "${TOOLBOX_PATH:-}" ]; then
+  echo "[run_probe] ERROR: Do not run this from distrobox/toolbox. Extract the GitHub Actions artifact on the Bazzite host and run it from a normal host terminal."
+  exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "[run_probe] ERROR: this script must be run with sudo/root so it can open /dev/uhid."
@@ -14,7 +19,15 @@ fi
 
 if [ ! -e /dev/uhid ]; then
   echo "[run_probe] ERROR: /dev/uhid does not exist."
-  echo "[run_probe] On Fedora/Bazzite, try loading the uhid module, then rerun this script."
+  echo "[run_probe] Try: sudo modprobe uhid"
+  echo "[run_probe] Then rerun: sudo ./scripts/guided_test.sh"
+  exit 1
+fi
+
+if [ ! -w /dev/uhid ]; then
+  echo "[run_probe] ERROR: /dev/uhid is not writable by the current effective user."
+  echo "[run_probe] Try: sudo modprobe uhid"
+  echo "[run_probe] Then rerun: sudo ./scripts/guided_test.sh"
   exit 1
 fi
 
@@ -34,11 +47,26 @@ find_cargo() {
   return 1
 }
 
-if [ ! -x "$BIN" ]; then
+if [ -f "$ROOT_DIR/ds4-bt-usb-probe" ]; then
+  chmod +x "$ROOT_DIR/ds4-bt-usb-probe" || {
+    echo "[run_probe] ERROR: artifact binary exists but could not be made executable: $ROOT_DIR/ds4-bt-usb-probe"
+    exit 1
+  }
+  BIN="$ROOT_DIR/ds4-bt-usb-probe"
+  echo "[run_probe] using artifact binary: $BIN"
+elif [ -f "$ROOT_DIR/target/release/ds4-bt-usb-probe" ]; then
+  chmod +x "$ROOT_DIR/target/release/ds4-bt-usb-probe" || {
+    echo "[run_probe] ERROR: source-build binary exists but could not be made executable: $ROOT_DIR/target/release/ds4-bt-usb-probe"
+    exit 1
+  }
+  BIN="$ROOT_DIR/target/release/ds4-bt-usb-probe"
+  echo "[run_probe] using source-build binary: $BIN"
+else
   echo "[run_probe] release binary not found; building it now"
   CARGO_BIN="$(find_cargo || true)"
   if [ -z "${CARGO_BIN:-}" ]; then
-    echo "[run_probe] ERROR: cargo not found. Install Rust or run ./scripts/build_release.sh from an environment with cargo."
+    echo "[run_probe] ERROR: no probe binary found and cargo is unavailable."
+    echo "[run_probe] Preferred fix: extract the GitHub Actions artifact on the Bazzite host and rerun this script."
     exit 1
   fi
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && command -v sudo >/dev/null 2>&1; then
@@ -47,6 +75,7 @@ if [ ! -x "$BIN" ]; then
   else
     (cd "$ROOT_DIR" && "$CARGO_BIN" build --release)
   fi
+  BIN="$ROOT_DIR/target/release/ds4-bt-usb-probe"
 fi
 
 if [ ! -x "$BIN" ]; then
@@ -75,4 +104,5 @@ else
 fi
 
 echo "[run_probe] launching probe. Keep this terminal open during the Diablo IV test."
+echo "[run_probe] probe effective user: $(id -u) (must be 0/root)"
 exec "$BIN" "${args[@]}"

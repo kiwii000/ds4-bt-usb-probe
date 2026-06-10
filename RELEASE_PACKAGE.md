@@ -16,10 +16,21 @@ Send that extracted folder to the remote tester. It contains:
 - `RELEASE_PACKAGE.md`
 - optional KDE launcher `Run DS4 Probe Test.desktop`
 
-On the Linux test machine, from inside the extracted artifact folder:
+Extract the artifact directly on the Bazzite host. Run the test from a normal Bazzite host terminal.
+
+**Do not run this from distrobox/toolbox.** Cargo inside distrobox may build the project, but the UHID probe needs the real host `/dev/uhid`.
+
+From inside the extracted artifact folder:
 
 ```bash
 chmod +x ds4-bt-usb-probe scripts/*.sh
+sudo ./scripts/guided_test.sh
+```
+
+If `/dev/uhid` is missing or inaccessible:
+
+```bash
+sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
@@ -39,7 +50,7 @@ If the desktop launcher does not work, run `sudo ./scripts/guided_test.sh` from 
 
 ## Path B: Build From Source Fallback
 
-If the GitHub Actions artifact is not available, send this project folder to the remote tester with these files included:
+If the GitHub Actions artifact is not available, send this project folder to the remote tester with these files included. Build and run it on the Bazzite host, not inside distrobox/toolbox:
 
 - `Cargo.toml`
 - `src/`

@@ -55,10 +55,21 @@ target/release/ds4-bt-usb-probe
 
 This is the easiest path for a remote tester. The script asks when to plug in USB, when to switch to Bluetooth, when to test Diablo IV, and then creates one results archive to send back.
 
-From the project root:
+Prefer the compiled GitHub Actions artifact. Extract it directly on the Bazzite host and run it from a normal host terminal.
+
+**Do not run the guided test or UHID probe from distrobox/toolbox.** A container may have Cargo available while still being unable to access the real host `/dev/uhid`.
+
+From the extracted artifact folder on the Bazzite host:
 
 ```bash
 chmod +x scripts/*.sh
+sudo ./scripts/guided_test.sh
+```
+
+If the script reports that `/dev/uhid` is missing or inaccessible, try:
+
+```bash
+sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
@@ -82,7 +93,7 @@ If the desktop launcher does not open correctly, use the terminal commands above
 
 This probe is implemented for remote testing only. It does not prove Diablo IV compatibility until the tester runs it on the target machine and reports the result.
 
-From the project root:
+Run these commands from a normal Bazzite host terminal, not distrobox/toolbox:
 
 ```bash
 chmod +x scripts/*.sh

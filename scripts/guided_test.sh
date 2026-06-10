@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+if [ -e /run/.containerenv ] || [ -e /.dockerenv ] || [ -n "${DISTROBOX_ENTER_PATH:-}" ] || [ -n "${CONTAINER_ID:-}" ] || [ -n "${TOOLBOX_PATH:-}" ]; then
+  echo "[guided] ERROR: Do not run this from distrobox/toolbox. Extract the GitHub Actions artifact on the Bazzite host and run it from a normal host terminal." >&2
+  exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     echo "[guided] Re-running with sudo so the probe can access /dev/uhid and hidraw diagnostics."
@@ -8,6 +13,20 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
   echo "[guided] ERROR: this script must be run with sudo/root." >&2
   echo "[guided] Try: sudo ./scripts/guided_test.sh" >&2
+  exit 1
+fi
+
+if [ ! -e /dev/uhid ]; then
+  echo "[guided] ERROR: /dev/uhid does not exist." >&2
+  echo "[guided] Try: sudo modprobe uhid" >&2
+  echo "[guided] Then rerun: sudo ./scripts/guided_test.sh" >&2
+  exit 1
+fi
+
+if [ ! -w /dev/uhid ]; then
+  echo "[guided] ERROR: /dev/uhid is not writable by the current effective user." >&2
+  echo "[guided] Try: sudo modprobe uhid" >&2
+  echo "[guided] Then rerun: sudo ./scripts/guided_test.sh" >&2
   exit 1
 fi
 
@@ -78,62 +97,45 @@ run_capture_step() {
   fi
 }
 
-find_probe_binary() {
-  if [ -x "$ROOT_DIR/ds4-bt-usb-probe" ]; then
-    printf '%s\n' "$ROOT_DIR/ds4-bt-usb-probe"
-    return 0
-  fi
-  if [ -x "$ROOT_DIR/target/release/ds4-bt-usb-probe" ]; then
-    printf '%s\n' "$ROOT_DIR/target/release/ds4-bt-usb-probe"
-    return 0
-  fi
-  return 1
-}
-
-latest_usb_descriptor_arg() {
-  local descriptor="$CAPTURE_ROOT/$TIMESTAMP/usb/report_descriptor.bin"
-  if [ -f "$descriptor" ]; then
-    printf '%s\n' "$descriptor"
-    return 0
-  fi
-  descriptor="$CAPTURE_ROOT/$TIMESTAMP/usb/hidraw/report_descriptor.bin"
-  if [ -f "$descriptor" ]; then
-    printf '%s\n' "$descriptor"
-    return 0
-  fi
-  return 1
-}
-
 start_probe() {
   echo
+  echo "Step 3:"
   echo "[guided] Starting UHID probe in the background"
 
-  local probe_bin
-  if probe_bin="$(find_probe_binary)"; then
-    local args=(--capture-root "$CAPTURE_ROOT")
-    local descriptor
-    if descriptor="$(latest_usb_descriptor_arg)"; then
-      echo "[guided] Using captured USB descriptor: $descriptor"
-      args+=(--descriptor "$descriptor")
-    else
-      echo "[guided] WARNING: no USB descriptor captured; probe will use its fallback descriptor."
-    fi
-
-    "$probe_bin" "${args[@]}" >"$PROBE_LOG" 2>&1 &
-    PROBE_PID=$!
-  else
-    echo "[guided] Release binary not found; falling back to scripts/run_probe.sh"
-    "$ROOT_DIR/scripts/run_probe.sh" >"$PROBE_LOG" 2>&1 &
-    PROBE_PID=$!
-  fi
+  "$ROOT_DIR/scripts/run_probe.sh" >"$PROBE_LOG" 2>&1 &
+  PROBE_PID=$!
 
   echo "$PROBE_PID" >"$RUN_DIR/probe.pid"
   echo "[guided] Probe PID: $PROBE_PID"
   echo "[guided] Probe output: $PROBE_LOG"
-  sleep 2
-  if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
-    echo "[guided] WARNING: probe process exited early. See $PROBE_LOG"
-  fi
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
+      probe_start_failed "probe process exited early"
+      return 1
+    fi
+    if grep -Eq '/dev/uhid opened|sending neutral USB-style DS4 input reports' "$PROBE_LOG"; then
+      echo "[guided] Probe startup confirmed."
+      return 0
+    fi
+    sleep 1
+  done
+
+  probe_start_failed "probe initialization was not confirmed after 10 seconds"
+  return 1
+}
+
+probe_start_failed() {
+  local reason="$1"
+  echo "[guided] ERROR: $reason. The Diablo IV test will not continue."
+  printf 'probe_start_failed: %s\n' "$reason" >"$RUN_DIR/diablo_test_result.txt"
+  echo "[guided] probe.log follows:"
+  echo "----------------------------------------"
+  cat "$PROBE_LOG" 2>/dev/null || true
+  echo "----------------------------------------"
+  stop_probe
+  copy_summaries
+  finish_archive
 }
 
 ask_diablo_result() {
@@ -177,7 +179,9 @@ run_capture_step usb
 pause_for_enter "Step 2: Disconnect USB, connect the controller by Bluetooth, then press Enter."
 run_capture_step bluetooth
 
-start_probe
+if ! start_probe; then
+  exit 1
+fi
 
 echo
 echo "Step 4:"
