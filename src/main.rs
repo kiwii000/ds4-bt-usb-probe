@@ -860,6 +860,7 @@ mod linux {
         ]
     }
 
+    #[allow(clippy::fn_to_numeric_cast)]
     fn install_signal_handlers() {
         // SAFETY: the handler only updates an AtomicBool.
         unsafe {
