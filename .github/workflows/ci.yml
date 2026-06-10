@@ -35,6 +35,7 @@ jobs:
           cp target/release/ds4-bt-usb-probe ds4-bt-usb-probe-linux-x86_64/
           cp -R scripts ds4-bt-usb-probe-linux-x86_64/
           cp README.md RELEASE_PACKAGE.md ds4-bt-usb-probe-linux-x86_64/
+          cp "Run DS4 Probe Test.desktop" ds4-bt-usb-probe-linux-x86_64/
 
       - name: Upload Linux x86_64 test artifact
         uses: actions/upload-artifact@v4

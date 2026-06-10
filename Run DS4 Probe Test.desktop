@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Run DS4 Probe Test
+Comment=Run the guided DS4 UHID probe test
+Terminal=false
+Exec=konsole --workdir . -e bash -lc 'sudo ./scripts/guided_test.sh; echo; read -r -p "Press Enter to close..."'
+Categories=Utility;

@@ -17,7 +17,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TIMESTAMP="${DS4_CAPTURE_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 BASE_DIR="$ROOT_DIR/captures/$TIMESTAMP/$MODE"
 
 mkdir -p \

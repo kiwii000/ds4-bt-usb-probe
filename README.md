@@ -51,6 +51,33 @@ The release binary will be:
 target/release/ds4-bt-usb-probe
 ```
 
+## Recommended guided test
+
+This is the easiest path for a remote tester. The script asks when to plug in USB, when to switch to Bluetooth, when to test Diablo IV, and then creates one results archive to send back.
+
+From the project root:
+
+```bash
+chmod +x scripts/*.sh
+sudo ./scripts/guided_test.sh
+```
+
+The script creates:
+
+```text
+ds4-probe-results-<timestamp>.tar.gz
+```
+
+Send that archive back after the test.
+
+Optional KDE/Bazzite desktop launcher:
+
+```text
+Run DS4 Probe Test.desktop
+```
+
+If the desktop launcher does not open correctly, use the terminal commands above.
+
 ## Friend test instructions
 
 This probe is implemented for remote testing only. It does not prove Diablo IV compatibility until the tester runs it on the target machine and reports the result.

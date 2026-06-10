@@ -14,17 +14,28 @@ Send that extracted folder to the remote tester. It contains:
 - `scripts/`
 - `README.md`
 - `RELEASE_PACKAGE.md`
+- optional KDE launcher `Run DS4 Probe Test.desktop`
 
 On the Linux test machine, from inside the extracted artifact folder:
 
 ```bash
 chmod +x ds4-bt-usb-probe scripts/*.sh
-sudo ./scripts/collect_ds4_identity.sh usb
-sudo ./scripts/collect_ds4_identity.sh bluetooth
-sudo ./scripts/run_probe.sh
+sudo ./scripts/guided_test.sh
 ```
 
-Then follow the `Friend test instructions` section in `README.md`.
+The preferred file to send back is:
+
+```text
+ds4-probe-results-<timestamp>.tar.gz
+```
+
+The tester may also try the optional KDE/Bazzite desktop launcher:
+
+```text
+Run DS4 Probe Test.desktop
+```
+
+If the desktop launcher does not work, run `sudo ./scripts/guided_test.sh` from a terminal.
 
 ## Path B: Build From Source Fallback
 
@@ -35,6 +46,7 @@ If the GitHub Actions artifact is not available, send this project folder to the
 - `scripts/`
 - `README.md`
 - `RELEASE_PACKAGE.md`
+- `Run DS4 Probe Test.desktop`
 - `.github/workflows/ci.yml`
 - `captures/.gitkeep`
 
@@ -49,7 +61,7 @@ Example package command from the project root:
 ```bash
 tar --exclude='./target' --exclude='./.git' \
   -czf ds4-bt-usb-probe.tar.gz \
-  Cargo.toml src scripts README.md RELEASE_PACKAGE.md .github captures/.gitkeep
+  Cargo.toml src scripts README.md RELEASE_PACKAGE.md "Run DS4 Probe Test.desktop" .github captures/.gitkeep
 ```
 
-The remote tester should unpack the source package on the Linux target machine, run `chmod +x scripts/*.sh`, build with `./scripts/build_release.sh`, then follow the `Friend test instructions` section in `README.md`.
+The remote tester should unpack the source package on the Linux target machine, run `chmod +x scripts/*.sh`, build with `./scripts/build_release.sh`, then run `sudo ./scripts/guided_test.sh`.
