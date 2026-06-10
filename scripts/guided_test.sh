@@ -37,6 +37,9 @@ RUN_DIR="$CAPTURE_ROOT/$TIMESTAMP/guided"
 ARCHIVE="$ROOT_DIR/ds4-probe-results-$TIMESTAMP.tar.gz"
 GUIDED_LOG="$RUN_DIR/guided_test.log"
 PROBE_LOG="$RUN_DIR/probe.log"
+STATUS_FILE="$RUN_DIR/bridge_status.txt"
+RESULT_SUMMARY="$RUN_DIR/result_summary.txt"
+PROTON_NOTES="$RUN_DIR/proton_visibility_notes.txt"
 PROBE_PID=""
 
 mkdir -p "$RUN_DIR"
@@ -48,10 +51,35 @@ bus_type=1
 version=0x0100 when captured/default identity permits
 input_report=0x01, 64-byte USB-style DS4
 
+Expected uinput fallback identity:
+bus=BUS_USB
+vendor=0x054c
+product=0x09cc
+version=captured input version, otherwise 0x8111
+name=Sony Interactive Entertainment Wireless Controller
+
 Physical Bluetooth comparison:
 HID_ID=0005:0000054C:000009CC
 bus_type=2
 input_report=0x11, 78-byte Bluetooth DS4
+EOF
+cat >"$PROTON_NOTES" <<'EOF'
+Proton visibility notes
+=======================
+Expected real USB identity:
+  HID_ID=0003:0000054C:000009CC
+  HID_NAME=Sony Interactive Entertainment Wireless Controller
+  bus_type=1
+
+v0.3 virtual identities:
+  UHID: BUS_USB / 054c:09cc with the captured USB descriptor and feature replies.
+  uinput: BUS_USB / 054c:09cc evdev gamepad with normal axes and buttons.
+  Both advertise USB-like input identity. Actual created-node status is in bridge_status.txt.
+
+Known caveat:
+  The UHID device is under /sys/devices/virtual/misc/uhid and has no real USB parent.
+  Proton previously saw that hidraw identity but marked it input=-1 / is_gamepad=0.
+  The uinput fallback exists to provide the normal evdev gamepad path Diablo IV may require.
 EOF
 exec > >(tee -a "$GUIDED_LOG") 2>&1
 
@@ -70,6 +98,7 @@ stop_probe() {
 }
 
 finish_archive() {
+  write_result_summary
   echo "[guided] Creating results archive"
   (
     cd "$CAPTURE_ROOT" &&
@@ -77,6 +106,47 @@ finish_archive() {
   )
   echo
   echo "Send this file back: $ARCHIVE"
+}
+
+status_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "$STATUS_FILE" 2>/dev/null | tail -n 1
+}
+
+status_number() {
+  local value
+  value="$(status_value "$1")"
+  printf '%s\n' "${value:-0}"
+}
+
+write_result_summary() {
+  {
+    echo "DS4 v0.3 guided result summary"
+    echo "timestamp=$TIMESTAMP"
+    echo
+    for mode in usb bluetooth; do
+      echo "[$mode real controller identity]"
+      if [ -f "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt" ]; then
+        cat "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt"
+      else
+        echo "summary=unavailable"
+      fi
+      echo
+    done
+    echo "[virtual bridge status]"
+    if [ -f "$STATUS_FILE" ]; then
+      cat "$STATUS_FILE"
+    else
+      echo "bridge_status=unavailable"
+    fi
+    echo
+    echo "[tester answers and guided results]"
+    for result in "$RUN_DIR"/steam_*.txt "$RUN_DIR"/diablo_*.txt "$RUN_DIR"/guided_gate_result.txt; do
+      [ -f "$result" ] || continue
+      printf '%s=' "$(basename "$result" .txt)"
+      cat "$result"
+    done
+  } >"$RESULT_SUMMARY"
 }
 
 cleanup_on_signal() {
@@ -110,12 +180,27 @@ run_capture_step() {
   fi
 }
 
+prepare_uinput() {
+  echo
+  echo "[guided] Checking uinput fallback support"
+  if [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ] && command -v modprobe >/dev/null 2>&1; then
+    echo "[guided] uinput node is absent; trying: modprobe uinput"
+    modprobe uinput 2>&1 || true
+  fi
+  if [ -e /dev/uinput ] || [ -e /dev/input/uinput ]; then
+    echo "[guided] uinput device node is available"
+  else
+    echo "[guided] WARNING: no uinput device node is visible; bridge startup will archive this failure"
+  fi
+}
+
 start_probe() {
   echo
   echo "Step 3:"
-  echo "[guided] Starting UHID probe in the background"
+  echo "[guided] Starting required UHID + uinput + Bluetooth bridge"
 
   DS4_RAW_CAPTURE_DIR="$RUN_DIR/raw_bluetooth_reports" \
+    DS4_STATUS_FILE="$STATUS_FILE" \
     "$ROOT_DIR/scripts/run_probe.sh" --bridge >"$PROBE_LOG" 2>&1 &
   PROBE_PID=$!
 
@@ -123,26 +208,50 @@ start_probe() {
   echo "[guided] Probe PID: $PROBE_PID"
   echo "[guided] Probe output: $PROBE_LOG"
   local attempt
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if [ -n "$(status_value uinput_error)" ] && [ "$(status_value uinput_ready)" != "true" ]; then
+      uinput_start_failed
+      return 1
+    fi
     if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
+      if [ -n "$(status_value uinput_error)" ]; then
+        uinput_start_failed
+        return 1
+      fi
       probe_start_failed "probe process exited early"
       return 1
     fi
-    if grep -Fq '[probe] READY: virtual DS4 initialized' "$PROBE_LOG" &&
-      grep -Fq '[bridge] READY: Bluetooth input stream opened' "$PROBE_LOG"; then
+    if [ "$(status_value uhid_ready)" = "true" ] &&
+      [ "$(status_value uinput_ready)" = "true" ] &&
+      [ "$(status_value bluetooth_ready)" = "true" ] &&
+      [ "$(status_number bluetooth_reports_read)" -gt 0 ] &&
+      [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
+      [ "$(status_number uhid_reports_emitted)" -gt 0 ] &&
+      [ "$(status_number uinput_events_emitted)" -gt 0 ]; then
       echo "[guided] Probe startup confirmed."
+      printf 'ready\n' >"$RUN_DIR/guided_gate_result.txt"
       return 0
     fi
     sleep 1
   done
 
-  probe_start_failed "virtual DS4 and Bluetooth bridge readiness were not confirmed after 20 seconds"
+  probe_start_failed "UHID, uinput, and active Bluetooth forwarding were not confirmed after 30 seconds"
   return 1
+}
+
+uinput_start_failed() {
+  echo "[guided] ERROR: uinput fallback failed, so this v0.3 Diablo test is not valid yet. Send back the archive."
+  printf 'uinput fallback failed\n' >"$RUN_DIR/guided_gate_result.txt"
+  cat "$PROBE_LOG" 2>/dev/null || true
+  stop_probe
+  copy_summaries
+  finish_archive
 }
 
 probe_start_failed() {
   local reason="$1"
   echo "[guided] ERROR: $reason. The Diablo IV test will not continue."
+  printf '%s\n' "$reason" >"$RUN_DIR/guided_gate_result.txt"
   printf 'probe_start_failed: %s\n' "$reason" >"$RUN_DIR/diablo_test_result.txt"
   echo "[guided] probe.log follows:"
   echo "----------------------------------------"
@@ -154,7 +263,10 @@ probe_start_failed() {
 }
 
 ensure_probe_alive() {
-  if [ -n "$PROBE_PID" ] && kill -0 "$PROBE_PID" >/dev/null 2>&1; then
+  if [ -n "$PROBE_PID" ] &&
+    kill -0 "$PROBE_PID" >/dev/null 2>&1 &&
+    [ "$(status_value uhid_ready)" = "true" ] &&
+    [ "$(status_value uinput_ready)" = "true" ]; then
     return 0
   fi
   probe_start_failed "probe or Bluetooth bridge exited during the Diablo IV test"
@@ -192,7 +304,7 @@ copy_summaries() {
 echo "DS4 Bluetooth/USB Probe Guided Test"
 echo "==================================="
 echo
-echo "This script will collect USB identity, collect Bluetooth identity, run the UHID probe,"
+echo "This script will collect USB identity, collect Bluetooth identity, run the UHID + uinput bridge,"
 echo "ask you to test Diablo IV, and create one archive to send back."
 echo
 echo "[guided] project root: $ROOT_DIR"
@@ -203,6 +315,8 @@ run_capture_step usb
 
 pause_for_enter "Step 2: Disconnect USB, connect the controller by Bluetooth, then press Enter."
 run_capture_step bluetooth
+
+prepare_uinput
 
 if ! start_probe; then
   exit 1
@@ -217,6 +331,8 @@ if ! ensure_probe_alive; then
   exit 1
 fi
 
+ask_result "Did Steam detect the controller?" "steam_controller_detected.txt"
+ask_result "Did Steam show it as PlayStation/DS4?" "steam_playstation_ds4.txt"
 ask_result "Did Diablo IV detect a controller?" "diablo_controller_detected.txt"
 ask_result "Did PlayStation glyphs appear?" "diablo_playstation_glyphs.txt"
 ask_result "Did input work?" "diablo_input_worked.txt"

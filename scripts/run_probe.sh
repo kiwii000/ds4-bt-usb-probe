@@ -3,11 +3,21 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN=""
-BRIDGE=0
-if [ "${1:-}" = "--bridge" ]; then
-  BRIDGE=1
-  shift
-fi
+MODE="probe"
+case "${1:-}" in
+  --bridge)
+    MODE="both"
+    shift
+    ;;
+  --uhid-only)
+    MODE="uhid"
+    shift
+    ;;
+  --probe-only)
+    MODE="probe"
+    shift
+    ;;
+esac
 
 echo "[run_probe] root=$ROOT_DIR"
 
@@ -100,6 +110,9 @@ if [ -d "$ROOT_DIR/captures" ]; then
 fi
 
 args=(--capture-root "$ROOT_DIR/captures")
+if [ -n "${DS4_STATUS_FILE:-}" ]; then
+  args+=(--status-file "$DS4_STATUS_FILE")
+fi
 if [ -n "$descriptor" ]; then
   echo "[run_probe] using captured descriptor: $descriptor"
   args+=(--descriptor "$descriptor")
@@ -125,9 +138,13 @@ fi
 
 echo "[run_probe] launching probe. Keep this terminal open during the Diablo IV test."
 echo "[run_probe] probe effective user: $(id -u) (must be 0/root)"
-if [ "$BRIDGE" -eq 1 ]; then
+if [ "$MODE" != "probe" ]; then
+  if [ "$MODE" = "both" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
+    echo "[run_probe] WARNING: no uinput device node is visible; the v0.3 default Diablo gate will fail"
+    echo "[run_probe] Try: sudo modprobe uinput"
+  fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"
-  bridge_args=(bridge "${args[@]}" --raw-capture-dir "$raw_capture_dir")
+  bridge_args=(bridge "${args[@]}" --raw-capture-dir "$raw_capture_dir" --output-mode "$MODE")
   exec "$BIN" "${bridge_args[@]}"
 fi
 exec "$BIN" "${args[@]}"

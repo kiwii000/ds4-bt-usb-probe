@@ -23,7 +23,7 @@ Extract the artifact directly on the Bazzite host. Run the test from a normal Ba
 From inside the extracted artifact folder:
 
 ```bash
-chmod +x ds4-bt-usb-probe scripts/*.sh
+chmod +x scripts/*.sh
 sudo ./scripts/guided_test.sh
 ```
 
@@ -34,13 +34,15 @@ sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
+The guided script also attempts `modprobe uinput` when the required v0.3 uinput fallback node is absent. If uinput still cannot be created, it stops before Diablo IV and packages the failure archive.
+
 The preferred file to send back is:
 
 ```text
 ds4-probe-results-<timestamp>.tar.gz
 ```
 
-Version 0.2 is a first functional bridge attempt. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
+Version 0.3 preserves the UHID Sony identity and adds a required uinput evdev fallback. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
 
 The tester may also try the optional KDE/Bazzite desktop launcher:
 

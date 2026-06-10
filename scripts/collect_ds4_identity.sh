@@ -211,6 +211,7 @@ record_identity_from_event_udev() {
   hex_to_prefixed "$product" >"$BASE_DIR/identity/product.txt" 2>/dev/null || true
   if [ -n "${version:-}" ]; then
     hex_to_prefixed "$version" >"$BASE_DIR/identity/version.txt" 2>/dev/null || true
+    hex_to_prefixed "$version" >"$BASE_DIR/identity/input_version.txt" 2>/dev/null || true
   fi
 
   name_line="$(sed -n 's/^E: NAME=//p' "$file" | head -n 1 | sed 's/^"//; s/"$//')"
@@ -230,6 +231,11 @@ if have lsusb; then
   run_to_file "$BASE_DIR/usb/lsusb-054c-09cc-v.txt" lsusb -d 054c:09cc -v
   if [ "$MODE" = "usb" ] && lsusb -d 054c:09cc >/dev/null 2>&1; then
     MATCH_FOUND=1
+    bcd_device="$(awk '$1 == "bcdDevice" { print $2; exit }' "$BASE_DIR/usb/lsusb-054c-09cc-v.txt" | tr -cd '[:xdigit:].' || true)"
+    bcd_digits="$(printf '%s' "$bcd_device" | tr -d '.')"
+    if [ -n "$bcd_digits" ]; then
+      printf '0x%04s\n' "$bcd_digits" | tr ' ' '0' >"$BASE_DIR/identity/usb_version.txt"
+    fi
   fi
 else
   echo "lsusb not found" >"$BASE_DIR/usb/lsusb-054c-09cc-v.txt"
@@ -324,7 +330,7 @@ done
 {
   echo "mode=$MODE"
   echo "timestamp=$TIMESTAMP"
-  for file in bus vendor product version name; do
+  for file in bus vendor product usb_version input_version version name; do
     if [ -s "$BASE_DIR/identity/$file.txt" ]; then
       printf '%s=' "$file"
       cat "$BASE_DIR/identity/$file.txt"
@@ -336,7 +342,7 @@ done
     echo "descriptor=not captured"
   fi
   if [ "$MODE" = "usb" ]; then
-    for report_id in 0x02 0x12 0xa3; do
+    for report_id in 0x02 0x12 0x81 0xa3; do
       if [ -s "$BASE_DIR/feature_reports/$report_id.bin" ]; then
         echo "feature_$report_id=captured"
       else
@@ -346,7 +352,7 @@ done
   fi
 } >"$BASE_DIR/identity/summary.txt"
 
-MATCH_PATTERN='sony|playstation|dualshock|054C|054c|09CC|09cc|hidraw|uhid'
+MATCH_PATTERN='sony|playstation|dualshock|054C|054c|09CC|09cc|hidraw|uhid|uinput|evdev'
 if have dmesg; then
   run_shell_to_file "$BASE_DIR/logs/dmesg-matches.txt" "dmesg --ctime --color=never 2>&1 | grep -Ei '$MATCH_PATTERN' || true"
 else
