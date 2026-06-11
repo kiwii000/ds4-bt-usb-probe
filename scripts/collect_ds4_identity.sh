@@ -299,8 +299,18 @@ for hidraw_dev in /dev/hidraw*; do
             echo "[collect] WARNING: feature report capture failed for $hidraw_dev"
             cat "$BASE_DIR/feature_reports/$hidraw_base-capture.log" || true
           }
+        echo "[collect] capturing USB DS4 idle input reports from $hidraw_dev; do not touch the controller"
+        mkdir -p "$BASE_DIR/idle_input"
+        "$probe_bin" capture-idle-input \
+          --hidraw "$hidraw_dev" \
+          --output-dir "$BASE_DIR/idle_input" \
+          --duration-ms 5000 \
+          >"$BASE_DIR/idle_input/$hidraw_base-idle-capture.log" 2>&1 || {
+            echo "[collect] WARNING: idle input capture failed for $hidraw_dev"
+            cat "$BASE_DIR/idle_input/$hidraw_base-idle-capture.log" || true
+          }
       else
-        echo "[collect] WARNING: probe binary unavailable; USB feature reports were not captured"
+        echo "[collect] WARNING: probe binary unavailable; USB feature reports and idle input template were not captured"
       fi
     fi
 

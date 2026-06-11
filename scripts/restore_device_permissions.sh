@@ -60,6 +60,14 @@ while IFS=$'\t' read -r kind node syspath acl_file stat_file; do
     failures=$((failures + 1))
     continue
   fi
+  if [ ! -e "$node" ]; then
+    echo "[restore] skipped: node no longer exists: $node" | tee -a "$LOG_FILE"
+    continue
+  fi
+  if [ -n "${syspath:-}" ] && [ ! -e "$syspath" ]; then
+    echo "[restore] skipped: node was recreated or syspath disappeared: $node -> $syspath" | tee -a "$LOG_FILE"
+    continue
+  fi
   if setfacl --restore="$acl_file" >>"$LOG_FILE" 2>&1; then
     echo "[restore] restored $node" | tee -a "$LOG_FILE"
     restored=$((restored + 1))

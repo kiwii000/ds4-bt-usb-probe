@@ -70,6 +70,13 @@ mod linux {
     const ABS_RZ: u16 = 0x05;
     const ABS_HAT0X: u16 = 0x10;
     const ABS_HAT0Y: u16 = 0x11;
+    const ABS_MT_SLOT: u16 = 0x2f;
+    const ABS_MT_POSITION_X: u16 = 0x35;
+    const ABS_MT_POSITION_Y: u16 = 0x36;
+    const ABS_MT_TRACKING_ID: u16 = 0x39;
+    const ABS_MT_FIRST: u16 = 0x2f;
+    const ABS_MT_LAST: u16 = 0x3e;
+    const BTN_TOUCH: u16 = 0x14a;
     const BTN_SOUTH: u16 = 0x130;
     const BTN_EAST: u16 = 0x131;
     const BTN_NORTH: u16 = 0x133;
@@ -95,6 +102,16 @@ mod linux {
     enum Command {
         Run(Config),
         CaptureFeatures { hidraw: PathBuf, output_dir: PathBuf },
+        CaptureIdleInput {
+            hidraw: PathBuf,
+            output_dir: PathBuf,
+            duration_ms: u64,
+        },
+        MonitorTouchpadEvents {
+            event: PathBuf,
+            output_dir: PathBuf,
+            duration_ms: u64,
+        },
     }
 
     #[derive(Debug)]
@@ -112,6 +129,9 @@ mod linux {
         raw_capture_dir: Option<PathBuf>,
         status_file: Option<PathBuf>,
         uinput_version: Option<u32>,
+        idle_template: Option<PathBuf>,
+        touchpad_mode: TouchpadMode,
+        uhid_identity_only: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +147,27 @@ mod linux {
                 Self::UhidOnly => "uhid",
             }
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TouchpadMode {
+        Neutralized,
+        HardDisabled,
+    }
+
+    impl TouchpadMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Neutralized => "neutralized",
+                Self::HardDisabled => "hard-disabled",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TouchpadTemplate {
+        report: [u8; 64],
+        source: String,
     }
 
     #[derive(Debug, Default)]
@@ -254,6 +295,16 @@ mod linux {
             Command::CaptureFeatures { hidraw, output_dir } => {
                 capture_features(&hidraw, &output_dir)
             }
+            Command::CaptureIdleInput {
+                hidraw,
+                output_dir,
+                duration_ms,
+            } => capture_idle_input(&hidraw, &output_dir, duration_ms),
+            Command::MonitorTouchpadEvents {
+                event,
+                output_dir,
+                duration_ms,
+            } => monitor_touchpad_events(&event, &output_dir, duration_ms),
             Command::Run(config) => run_device(config),
         }
     }
@@ -270,8 +321,20 @@ mod linux {
         let uinput_version_source =
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
-        status.set("probe_version", "0.5.0");
+        let touchpad_template = load_touchpad_template(&config);
+        status.set("probe_version", "0.5.1");
         status.set("output_mode", config.output_mode.as_str());
+        status.set("touchpad_mode", config.touchpad_mode.as_str());
+        status.set("touchpad_template_source", &touchpad_template.source);
+        status.set("uhid_identity_only", config.uhid_identity_only.to_string());
+        status.set(
+            "selected_runtime_mode",
+            if config.uhid_identity_only {
+                "identity-only-uhid"
+            } else {
+                "full-uhid-input"
+            },
+        );
         status.set("uhid_ready", "false");
         status.set("uinput_required", (config.output_mode == OutputMode::Both).to_string());
         status.set("uinput_enabled", (config.output_mode == OutputMode::Both).to_string());
@@ -341,7 +404,7 @@ mod linux {
             })?;
         println!("[probe] UHID_CREATE2 sent");
 
-        let report = neutral_usb_ds4_report();
+        let report = neutral_usb_ds4_report(&touchpad_template);
         send_checked_uhid_report(&mut device, &report, &status, "initial-neutral")?;
         wait_for_virtual_device(
             &mut device,
@@ -363,6 +426,7 @@ mod linux {
                 &mut device,
                 &config,
                 report,
+                touchpad_template,
                 uinput_version,
                 uinput_version_source,
                 &name,
@@ -401,6 +465,7 @@ mod linux {
         device: &mut UhidDevice,
         config: &Config,
         neutral: [u8; 64],
+        touchpad_template: TouchpadTemplate,
         uinput_version: u32,
         uinput_version_source: &str,
         name: &str,
@@ -460,14 +525,10 @@ mod linux {
         })?;
         println!("[bridge] physical Bluetooth hidraw: {}", hidraw.display());
         status.set("bluetooth_hidraw", hidraw.display().to_string());
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&hidraw)
-            .map_err(|err| {
-                status.set("bluetooth_error", format!("could not open {}: {err}", hidraw.display()));
-                io::Error::new(err.kind(), format!("could not open {}: {err}", hidraw.display()))
-            })?;
+        let mut input = open_bluetooth_input(&hidraw).map_err(|err| {
+            status.set("bluetooth_error", format!("could not open {}: {err}", hidraw.display()));
+            io::Error::new(err.kind(), format!("could not open {}: {err}", hidraw.display()))
+        })?;
         let raw_dir = config
             .raw_capture_dir
             .clone()
@@ -477,6 +538,7 @@ mod linux {
         let mut unexpected_count = 0_u32;
         let mut last_keepalive = Instant::now();
         let mut forwarded = 0_u64;
+        let mut reconnect_attempted = false;
         let mut pollfd = libc::pollfd {
             fd: input.as_raw_fd(),
             events: libc::POLLIN,
@@ -497,11 +559,43 @@ mod linux {
                 }
                 return Err(err.into());
             }
-            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(io::Error::other(format!(
-                    "Bluetooth hidraw poll failure: revents=0x{:x}",
-                    pollfd.revents
-                ))
+            if bluetooth_hidraw_loss_revents(pollfd.revents) {
+                let revents = pollfd.revents;
+                println!(
+                    "[bridge] Bluetooth controller disconnected or hidraw node disappeared: revents=0x{revents:x}"
+                );
+                status.set("bluetooth_hidraw_lost", "true");
+                status.set("bluetooth_hidraw_loss_revents", format!("0x{revents:x}"));
+                status.set("clean_hidraw_loss", "yes");
+                if !reconnect_attempted {
+                    reconnect_attempted = true;
+                    status.set("bluetooth_reconnect_attempts", "1");
+                    if let Some(new_hidraw) = discover_bluetooth_hidraw(config.vid, config.pid) {
+                        println!("[bridge] attempting one reconnect to {}", new_hidraw.display());
+                        match open_bluetooth_input(&new_hidraw) {
+                            Ok(reopened) => {
+                                input = reopened;
+                                pollfd.fd = input.as_raw_fd();
+                                pollfd.revents = 0;
+                                status.set("bluetooth_reconnect_success", "true");
+                                status.set("bluetooth_hidraw", new_hidraw.display().to_string());
+                                println!("[bridge] Bluetooth hidraw reconnect succeeded");
+                                continue;
+                            }
+                            Err(err) => {
+                                status.set(
+                                    "bluetooth_error",
+                                    format!("Bluetooth hidraw reconnect failed: {err}"),
+                                );
+                            }
+                        }
+                    } else {
+                        status.set("bluetooth_error", "Bluetooth hidraw did not reappear");
+                    }
+                }
+                return Err(io::Error::other(
+                    "Bluetooth controller disconnected or hidraw node disappeared",
+                )
                 .into());
             }
             if poll_result == 0 || pollfd.revents & libc::POLLIN == 0 {
@@ -516,15 +610,17 @@ mod linux {
                 Ok(0) => {}
                 Ok(size) => {
                     status.increment("bluetooth_reports_read", 1);
-                    match translate_bluetooth_report(&buffer[..size]) {
+                    match translate_bluetooth_report(&buffer[..size], &touchpad_template) {
                         Ok(translated) => {
-                            send_checked_uhid_report(
-                                device,
-                                &translated.usb_report,
-                                status,
-                                "bridge-translated",
-                            )?;
-                            status.increment("uhid_reports_emitted", 1);
+                            if !config.uhid_identity_only {
+                                send_checked_uhid_report(
+                                    device,
+                                    &translated.usb_report,
+                                    status,
+                                    "bridge-translated",
+                                )?;
+                                status.increment("uhid_reports_emitted", 1);
+                            }
                             if let Some(output) = uinput.as_mut() {
                                 let emitted =
                                     output.emit_state(&translated.gamepad).map_err(|err| {
@@ -1173,6 +1269,174 @@ mod linux {
         Ok(())
     }
 
+    fn capture_idle_input(
+        hidraw: &Path,
+        output_dir: &Path,
+        duration_ms: u64,
+    ) -> Result<(), AnyError> {
+        fs::create_dir_all(output_dir)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(hidraw)?;
+        println!(
+            "[idle-capture] hidraw={} duration_ms={duration_ms}",
+            hidraw.display()
+        );
+        let deadline = Instant::now() + Duration::from_millis(duration_ms.max(100));
+        let mut buffer = [0_u8; 256];
+        let mut report_count = 0_u32;
+        let mut selected = None;
+        while Instant::now() < deadline {
+            match file.read(&mut buffer) {
+                Ok(0) => thread::sleep(Duration::from_millis(5)),
+                Ok(size) => {
+                    if buffer[0] == 0x01 && size == 64 {
+                        let mut report = [0_u8; 64];
+                        report.copy_from_slice(&buffer[..64]);
+                        let index = report_count;
+                        report_count += 1;
+                        fs::write(output_dir.join(format!("idle-report-{index:03}.bin")), report)?;
+                        fs::write(
+                            output_dir.join(format!("idle-report-{index:03}.hex")),
+                            format!("{}\n", hex_all(&report)),
+                        )?;
+                        selected = Some(report);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let captured = selected.is_some();
+        if let Some(report) = selected {
+            fs::write(output_dir.join("idle_template.bin"), report)?;
+            fs::write(output_dir.join("selected_idle_report.bin"), report)?;
+            fs::write(
+                output_dir.join("idle_template.hex"),
+                format!("{}\n", hex_all(&report)),
+            )?;
+        }
+        fs::write(
+            output_dir.join("status.txt"),
+            format!(
+                "usb_idle_template_captured={}\nusb_idle_reports_captured={report_count}\n",
+                if captured { "yes" } else { "no" }
+            ),
+        )?;
+        println!(
+            "[idle-capture] usb_idle_template_captured={} reports={report_count}",
+            if captured { "yes" } else { "no" }
+        );
+        Ok(())
+    }
+
+    fn monitor_touchpad_events(
+        event: &Path,
+        output_dir: &Path,
+        duration_ms: u64,
+    ) -> Result<(), AnyError> {
+        fs::create_dir_all(output_dir)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(event)?;
+        println!(
+            "[event-monitor] event={} duration_ms={duration_ms}",
+            event.display()
+        );
+        let deadline = Instant::now() + Duration::from_millis(duration_ms.max(100));
+        let mut event_count = 0_u32;
+        let mut sample_lines = Vec::new();
+        while Instant::now() < deadline {
+            match read_input_event(&mut file) {
+                Ok(Some(input_event)) => {
+                    if let Some(label) = touchpad_event_label(&input_event) {
+                        event_count += 1;
+                        let line = format!(
+                            "type=0x{:04x} code=0x{:04x} value={} label={label}",
+                            input_event.event_type, input_event.code, input_event.value
+                        );
+                        if sample_lines.len() < 50 {
+                            sample_lines.push(line.clone());
+                        }
+                        println!("[event-monitor] touchpad_event {line}");
+                    }
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let clean = event_count == 0;
+        fs::write(
+            output_dir.join("touchpad-events.txt"),
+            if sample_lines.is_empty() {
+                "no touchpad events seen\n".to_string()
+            } else {
+                format!("{}\n", sample_lines.join("\n"))
+            },
+        )?;
+        fs::write(
+            output_dir.join("status.txt"),
+            format!(
+                "uhid_event_touchpad_idle_clean={}\nuhid_event_touchpad_events_seen={event_count}\nuhid_event_touchpad_event_samples={}\n",
+                if clean { "yes" } else { "no" },
+                output_dir.join("touchpad-events.txt").display()
+            ),
+        )?;
+        println!(
+            "[event-monitor] uhid_event_touchpad_idle_clean={} events={event_count}",
+            if clean { "yes" } else { "no" }
+        );
+        Ok(())
+    }
+
+    fn read_input_event(file: &mut File) -> io::Result<Option<InputEvent>> {
+        let mut event = InputEvent {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            event_type: 0,
+            code: 0,
+            value: 0,
+        };
+        let expected = size_of::<InputEvent>();
+        let size = {
+            let data = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (&mut event as *mut InputEvent).cast::<u8>(),
+                    expected,
+                )
+            };
+            file.read(data)
+        }?;
+        match size {
+            0 => Ok(None),
+            size if size == expected => Ok(Some(event)),
+            _ => Ok(None),
+        }
+    }
+
+    fn touchpad_event_label(event: &InputEvent) -> Option<&'static str> {
+        match (event.event_type, event.code) {
+            (EV_KEY, BTN_TOUCH) => Some("BTN_TOUCH"),
+            (EV_ABS, ABS_MT_TRACKING_ID) => Some("ABS_MT_TRACKING_ID"),
+            (EV_ABS, ABS_MT_POSITION_X) => Some("ABS_MT_POSITION_X"),
+            (EV_ABS, ABS_MT_POSITION_Y) => Some("ABS_MT_POSITION_Y"),
+            (EV_ABS, ABS_MT_SLOT) => Some("ABS_MT_SLOT"),
+            (EV_ABS, ABS_MT_FIRST..=ABS_MT_LAST) => Some("ABS_MT"),
+            _ => None,
+        }
+    }
+
     fn hidiocgfeature(size: usize) -> libc::c_ulong {
         const IOC_READ: libc::c_ulong = 2;
         const IOC_WRITE: libc::c_ulong = 1;
@@ -1206,6 +1470,48 @@ mod linux {
                 output_dir: output_dir.ok_or_else(|| io::Error::other("--output-dir is required"))?,
             }));
         }
+        if args.peek().is_some_and(|arg| arg == "capture-idle-input") {
+            let _ = args.next();
+            let mut hidraw = None;
+            let mut output_dir = None;
+            let mut duration_ms = 5000;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--hidraw" => hidraw = Some(PathBuf::from(next_value(&mut args, "--hidraw")?)),
+                    "--output-dir" => {
+                        output_dir = Some(PathBuf::from(next_value(&mut args, "--output-dir")?))
+                    }
+                    "--duration-ms" => duration_ms = next_value(&mut args, &arg)?.parse()?,
+                    _ => return Err(io::Error::other(format!("unknown capture-idle-input argument {arg}")).into()),
+                }
+            }
+            return Ok(Some(Command::CaptureIdleInput {
+                hidraw: hidraw.ok_or_else(|| io::Error::other("--hidraw is required"))?,
+                output_dir: output_dir.ok_or_else(|| io::Error::other("--output-dir is required"))?,
+                duration_ms,
+            }));
+        }
+        if args.peek().is_some_and(|arg| arg == "monitor-touchpad-events") {
+            let _ = args.next();
+            let mut event = None;
+            let mut output_dir = None;
+            let mut duration_ms = 7000;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--event" => event = Some(PathBuf::from(next_value(&mut args, "--event")?)),
+                    "--output-dir" => {
+                        output_dir = Some(PathBuf::from(next_value(&mut args, "--output-dir")?))
+                    }
+                    "--duration-ms" => duration_ms = next_value(&mut args, &arg)?.parse()?,
+                    _ => return Err(io::Error::other(format!("unknown monitor-touchpad-events argument {arg}")).into()),
+                }
+            }
+            return Ok(Some(Command::MonitorTouchpadEvents {
+                event: event.ok_or_else(|| io::Error::other("--event is required"))?,
+                output_dir: output_dir.ok_or_else(|| io::Error::other("--output-dir is required"))?,
+                duration_ms,
+            }));
+        }
         if args.peek().is_some_and(|arg| arg == "bridge") {
             let _ = args.next();
             bridge = true;
@@ -1228,6 +1534,9 @@ mod linux {
             raw_capture_dir: None,
             status_file: None,
             uinput_version: None,
+            idle_template: None,
+            touchpad_mode: TouchpadMode::Neutralized,
+            uhid_identity_only: false,
         };
         while let Some(arg) = args.next() {
             if arg == "-h" || arg == "--help" {
@@ -1250,6 +1559,22 @@ mod linux {
                 }
                 "--uinput-version" => {
                     config.uinput_version = Some(parse_hex_or_dec(&next_value(&mut args, &arg)?)?)
+                }
+                "--idle-template" => {
+                    config.idle_template = Some(PathBuf::from(next_value(&mut args, &arg)?))
+                }
+                "--uhid-identity-only" => config.uhid_identity_only = true,
+                "--touchpad-mode" => {
+                    config.touchpad_mode = match next_value(&mut args, &arg)?.as_str() {
+                        "neutralized" => TouchpadMode::Neutralized,
+                        "hard-disabled" => TouchpadMode::HardDisabled,
+                        value => {
+                            return Err(io::Error::other(format!(
+                                "invalid --touchpad-mode {value}; expected neutralized or hard-disabled"
+                            ))
+                            .into())
+                        }
+                    }
                 }
                 "--output-mode" => {
                     config.output_mode = match next_value(&mut args, &arg)?.as_str() {
@@ -1325,8 +1650,11 @@ mod linux {
         }
     }
 
-    fn translate_bluetooth_report(input: &[u8]) -> Result<TranslatedInput, &'static str> {
-        let mut output = neutral_usb_ds4_report();
+    fn translate_bluetooth_report(
+        input: &[u8],
+        touchpad_template: &TouchpadTemplate,
+    ) -> Result<TranslatedInput, &'static str> {
+        let mut output = neutral_usb_ds4_report(touchpad_template);
         match input.first().copied() {
             Some(0x11) if input.len() == 78 => {
                 output[1..10].copy_from_slice(&input[3..12]);
@@ -1339,7 +1667,7 @@ mod linux {
             Some(_) => return Err("unsupported Bluetooth report id"),
             None => return Err("empty Bluetooth report"),
         }
-        neutralize_usb_ds4_touchpad(&mut output);
+        hard_disable_usb_ds4_touchpad(&mut output, touchpad_template);
         Ok(TranslatedInput {
             gamepad: gamepad_state_from_usb_report(&output),
             usb_report: output,
@@ -1448,6 +1776,17 @@ mod linux {
 
     fn discover_bluetooth_hidraw(vid: u32, pid: u32) -> Option<PathBuf> {
         discover_hidraw_by_id(0x0005, vid, pid, false).into_iter().next()
+    }
+
+    fn open_bluetooth_input(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+
+    fn bluetooth_hidraw_loss_revents(revents: i16) -> bool {
+        revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
     }
 
     fn discover_virtual_devices(vid: u32, pid: u32) -> (Vec<PathBuf>, Vec<String>) {
@@ -1604,12 +1943,15 @@ mod linux {
         contacts: Vec<DecodedTouchContact>,
     }
 
-    fn neutral_usb_ds4_report() -> [u8; 64] {
+    const DS4_USB_TOUCHPAD_BLOCK_OFFSET: usize = DS4_USB_TOUCH_REPORT_COUNT_OFFSET;
+    const DS4_USB_TOUCHPAD_BLOCK_END: usize = 64;
+
+    fn neutral_usb_ds4_report(touchpad_template: &TouchpadTemplate) -> [u8; 64] {
         let mut report = [0_u8; 64];
         report[DS4_USB_REPORT_ID_OFFSET] = 0x01;
         report[1..5].fill(0x80);
         report[5] = 0x08;
-        neutralize_usb_ds4_touchpad(&mut report);
+        hard_disable_usb_ds4_touchpad(&mut report, touchpad_template);
         report
     }
 
@@ -1619,9 +1961,92 @@ mod linux {
         let touch_data_end =
             DS4_USB_TOUCH_REPORTS_OFFSET + DS4_USB_TOUCH_REPORT_LEN * 3;
         report[DS4_USB_TOUCH_REPORTS_OFFSET..touch_data_end].fill(0);
+        mark_usb_ds4_touch_contacts_inactive(report);
+    }
+
+    fn mark_usb_ds4_touch_contacts_inactive(report: &mut [u8; 64]) {
         for offset in DS4_TOUCH_CONTACT_OFFSETS {
             report[offset] = DS4_TOUCH_CONTACT_INACTIVE;
         }
+    }
+
+    fn hard_disable_usb_ds4_touchpad(report: &mut [u8; 64], touchpad_template: &TouchpadTemplate) {
+        report[DS4_USB_BUTTONS2_OFFSET] &= !DS4_USB_TOUCHPAD_BUTTON_BIT;
+        report[DS4_USB_TOUCHPAD_BLOCK_OFFSET..DS4_USB_TOUCHPAD_BLOCK_END]
+            .copy_from_slice(&touchpad_template.report[DS4_USB_TOUCHPAD_BLOCK_OFFSET..DS4_USB_TOUCHPAD_BLOCK_END]);
+        mark_usb_ds4_touch_contacts_inactive(report);
+    }
+
+    fn fallback_touchpad_template_report() -> [u8; 64] {
+        let mut report = [0_u8; 64];
+        report[DS4_USB_REPORT_ID_OFFSET] = 0x01;
+        report[1..5].fill(0x80);
+        report[5] = 0x08;
+        report[DS4_USB_TOUCH_REPORT_COUNT_OFFSET] = 1;
+        report[DS4_USB_TOUCH_REPORTS_OFFSET
+            ..DS4_USB_TOUCH_REPORTS_OFFSET + DS4_USB_TOUCH_REPORT_LEN * 3]
+            .fill(0);
+        for offset in DS4_TOUCH_CONTACT_OFFSETS {
+            report[offset] = DS4_TOUCH_CONTACT_INACTIVE;
+        }
+        report
+    }
+
+    fn load_touchpad_template(config: &Config) -> TouchpadTemplate {
+        if config.touchpad_mode == TouchpadMode::HardDisabled {
+            if let Some(path) = config
+                .idle_template
+                .clone()
+                .or_else(|| latest_usb_idle_template(&config.capture_root))
+            {
+                match read_usb_report_template(&path) {
+                    Ok(report) => {
+                        println!("[touchpad] using captured USB idle template: {}", path.display());
+                        return TouchpadTemplate {
+                            report,
+                            source: format!("captured {}", path.display()),
+                        };
+                    }
+                    Err(err) => {
+                        println!(
+                            "[touchpad] WARNING: could not use idle template {}: {err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        TouchpadTemplate {
+            report: fallback_touchpad_template_report(),
+            source: "built-in hard-disabled no-touch fallback".to_string(),
+        }
+    }
+
+    fn read_usb_report_template(path: &Path) -> io::Result<[u8; 64]> {
+        let data = fs::read(path)?;
+        if data.len() != 64 || data.first() != Some(&0x01) {
+            return Err(io::Error::other("idle template must be a 64-byte report id 0x01"));
+        }
+        let mut report = [0_u8; 64];
+        report.copy_from_slice(&data);
+        Ok(report)
+    }
+
+    fn latest_usb_idle_template(capture_root: &Path) -> Option<PathBuf> {
+        let mut files = fs::read_dir(capture_root)
+            .ok()?
+            .flatten()
+            .flat_map(|entry| {
+                let path = entry.path();
+                [
+                    path.join("usb/idle_input/idle_template.bin"),
+                    path.join("usb/idle_input/selected_idle_report.bin"),
+                ]
+            })
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.pop()
     }
 
     fn decode_usb_ds4_touchpad(report: &[u8; 64]) -> DecodedTouchpad {
@@ -1881,12 +2306,14 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.5
+            "ds4-bt-usb-probe 0.5.1
 
 Commands:
   ds4-bt-usb-probe [options]
   ds4-bt-usb-probe bridge --output-mode <both|uhid> --status-file <path>
   ds4-bt-usb-probe capture-features --hidraw <path> --output-dir <dir>
+  ds4-bt-usb-probe capture-idle-input --hidraw <path> --output-dir <dir> [--duration-ms <n>]
+  ds4-bt-usb-probe monitor-touchpad-events --event <path> --output-dir <dir> [--duration-ms <n>]
 "
         );
     }
@@ -1894,6 +2321,13 @@ Commands:
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn test_touchpad_template() -> TouchpadTemplate {
+            TouchpadTemplate {
+                report: fallback_touchpad_template_report(),
+                source: "test".to_string(),
+            }
+        }
 
         #[test]
         fn synthetic_features_have_expected_ids_and_sizes() {
@@ -1948,7 +2382,8 @@ Commands:
 
         #[test]
         fn neutral_report_marks_all_touch_contacts_inactive() {
-            let report = neutral_usb_ds4_report();
+            let template = test_touchpad_template();
+            let report = neutral_usb_ds4_report(&template);
             assert_eq!(report[DS4_USB_TOUCH_REPORT_COUNT_OFFSET], 1);
             assert_eq!(report[DS4_USB_BUTTONS2_OFFSET] & DS4_USB_TOUCHPAD_BUTTON_BIT, 0);
             for offset in DS4_TOUCH_CONTACT_OFFSETS {
@@ -1962,12 +2397,13 @@ Commands:
         #[test]
         fn full_bluetooth_report_maps_common_controls() {
             let mut bt = [0_u8; 78];
+            let template = test_touchpad_template();
             bt[0] = 0x11;
             for (index, byte) in bt[3..35].iter_mut().enumerate() {
                 *byte = index as u8;
             }
             bt[9] |= DS4_USB_TOUCHPAD_BUTTON_BIT;
-            let translated = translate_bluetooth_report(&bt).unwrap();
+            let translated = translate_bluetooth_report(&bt, &template).unwrap();
             assert_eq!(translated.usb_report[0], 0x01);
             let mut expected_common = [0_u8; 9];
             expected_common.copy_from_slice(&bt[3..12]);
@@ -1975,7 +2411,7 @@ Commands:
             assert_eq!(&translated.usb_report[1..10], &expected_common);
             assert_eq!(
                 &translated.usb_report[10..],
-                &neutral_usb_ds4_report()[10..]
+                &neutral_usb_ds4_report(&template)[10..]
             );
             assert_eq!(decode_usb_ds4_touchpad(&translated.usb_report).active_contacts, 0);
         }
@@ -1983,7 +2419,8 @@ Commands:
         #[test]
         fn minimal_bluetooth_report_maps_basic_controls() {
             let bt = [0x01, 1, 2, 3, 4, 5, 6, 7 | DS4_USB_TOUCHPAD_BUTTON_BIT, 8, 9];
-            let translated = translate_bluetooth_report(&bt).unwrap();
+            let template = test_touchpad_template();
+            let translated = translate_bluetooth_report(&bt, &template).unwrap();
             let mut expected = bt;
             expected[7] &= !DS4_USB_TOUCHPAD_BUTTON_BIT;
             assert_eq!(&translated.usb_report[..10], &expected);
@@ -1992,7 +2429,8 @@ Commands:
 
         #[test]
         fn touchpad_decoder_detects_intentionally_active_contact() {
-            let mut report = neutral_usb_ds4_report();
+            let template = test_touchpad_template();
+            let mut report = neutral_usb_ds4_report(&template);
             let offset = DS4_TOUCH_CONTACT_OFFSETS[0];
             report[offset] = 0x01;
             report[offset + 1] = 0x34;
@@ -2007,10 +2445,63 @@ Commands:
         }
 
         #[test]
+        fn hard_disabled_touchpad_freezes_template_tail() {
+            let mut template_report = fallback_touchpad_template_report();
+            for (index, byte) in template_report[DS4_USB_TOUCHPAD_BLOCK_OFFSET..]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = 0xa0_u8.wrapping_add(index as u8);
+            }
+            for offset in DS4_TOUCH_CONTACT_OFFSETS {
+                template_report[offset] = DS4_TOUCH_CONTACT_INACTIVE | 0x05;
+            }
+            let template = TouchpadTemplate {
+                report: template_report,
+                source: "unit-test".to_string(),
+            };
+            let mut bt = [0_u8; 78];
+            bt[0] = 0x11;
+            bt[3..12].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            let translated = translate_bluetooth_report(&bt, &template).unwrap();
+            let mut expected_tail = template.report;
+            mark_usb_ds4_touch_contacts_inactive(&mut expected_tail);
+            assert_eq!(
+                &translated.usb_report[DS4_USB_TOUCHPAD_BLOCK_OFFSET..],
+                &expected_tail[DS4_USB_TOUCHPAD_BLOCK_OFFSET..]
+            );
+            assert_eq!(decode_usb_ds4_touchpad(&translated.usb_report).active_contacts, 0);
+        }
+
+        #[test]
+        fn touchpad_event_classifier_detects_multitouch_events() {
+            let mut event = input_event(EV_KEY, BTN_TOUCH, 1);
+            assert_eq!(touchpad_event_label(&event), Some("BTN_TOUCH"));
+            event = input_event(EV_ABS, ABS_MT_TRACKING_ID, 12);
+            assert_eq!(touchpad_event_label(&event), Some("ABS_MT_TRACKING_ID"));
+            event = input_event(EV_ABS, ABS_MT_POSITION_X, 100);
+            assert_eq!(touchpad_event_label(&event), Some("ABS_MT_POSITION_X"));
+            event = input_event(EV_ABS, ABS_MT_POSITION_Y, 100);
+            assert_eq!(touchpad_event_label(&event), Some("ABS_MT_POSITION_Y"));
+            event = input_event(EV_ABS, ABS_X, 128);
+            assert_eq!(touchpad_event_label(&event), None);
+        }
+
+        #[test]
+        fn hidraw_loss_revents_are_classified_for_clean_shutdown() {
+            assert!(!bluetooth_hidraw_loss_revents(libc::POLLIN));
+            assert!(bluetooth_hidraw_loss_revents(libc::POLLERR));
+            assert!(bluetooth_hidraw_loss_revents(libc::POLLHUP));
+            assert!(bluetooth_hidraw_loss_revents(libc::POLLNVAL));
+            assert!(bluetooth_hidraw_loss_revents(libc::POLLIN | libc::POLLHUP));
+        }
+
+        #[test]
         fn unexpected_report_is_rejected() {
-            assert!(translate_bluetooth_report(&[0x99, 0]).is_err());
-            assert!(translate_bluetooth_report(&[0x11; 35]).is_err());
-            assert!(translate_bluetooth_report(&[0x01; 11]).is_err());
+            let template = test_touchpad_template();
+            assert!(translate_bluetooth_report(&[0x99, 0], &template).is_err());
+            assert!(translate_bluetooth_report(&[0x11; 35], &template).is_err());
+            assert!(translate_bluetooth_report(&[0x01; 11], &template).is_err());
         }
 
         #[test]
@@ -2051,7 +2542,8 @@ Commands:
 
         #[test]
         fn gamepad_state_maps_buttons_dpad_and_uinput_events() {
-            let mut usb = neutral_usb_ds4_report();
+            let template = test_touchpad_template();
+            let mut usb = neutral_usb_ds4_report(&template);
             usb[5] = 0x20 | 0x01;
             usb[6] = 0x01 | 0x10 | 0x40;
             usb[7] = 0x01;

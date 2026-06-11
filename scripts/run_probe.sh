@@ -136,11 +136,34 @@ else
   echo "[run_probe] WARNING: no captured USB feature reports found; synthetic fallbacks will be used"
 fi
 
+idle_template=""
+if [ -d "$ROOT_DIR/captures" ]; then
+  idle_template="$(
+    find "$ROOT_DIR/captures" \
+      \( -path '*/usb/idle_input/idle_template.bin' -o -path '*/usb/idle_input/selected_idle_report.bin' \) \
+      -type f -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr \
+      | awk 'NR == 1 { sub(/^[^ ]+ /, ""); print; exit }'
+  )"
+fi
+if [ -n "$idle_template" ]; then
+  echo "[run_probe] using captured USB idle input template: $idle_template"
+  args+=(--idle-template "$idle_template")
+else
+  echo "[run_probe] WARNING: no captured USB idle input template found; hard-disabled fallback block will be used"
+fi
+
 echo "[run_probe] launching probe. Keep this terminal open during the Diablo IV test."
 echo "[run_probe] probe effective user: $(id -u) (must be 0/root)"
 if [ "$MODE" != "probe" ]; then
+  touchpad_mode="${DS4_TOUCHPAD_MODE:-hard-disabled}"
+  args+=(--touchpad-mode "$touchpad_mode")
+  if [ "${DS4_UHID_IDENTITY_ONLY:-no}" = "yes" ] || [ "${DS4_UHID_IDENTITY_ONLY:-false}" = "true" ]; then
+    echo "[run_probe] UHID identity-only mode enabled; gameplay input will be emitted through uinput"
+    args+=(--uhid-identity-only)
+  fi
   if [ "$MODE" = "both" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
-    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5 default Diablo gate will fail"
+    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5.1 default Diablo gate will fail"
     echo "[run_probe] Try: sudo modprobe uinput"
   fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"
