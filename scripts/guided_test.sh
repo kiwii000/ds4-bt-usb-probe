@@ -64,6 +64,7 @@ GUIDED_LOG="$RUN_DIR/guided_test.log"
 PROBE_LOG="$RUN_DIR/probe.log"
 STATUS_FILE="$RUN_DIR/bridge_status.txt"
 MONITOR_DIR="$RUN_DIR/uhid_event_touchpad_monitor"
+UINPUT_MONITOR_DIR="$RUN_DIR/uinput_event_monitor"
 RESULT_SUMMARY="$RUN_DIR/result_summary.txt"
 PROTON_NOTES="$RUN_DIR/proton_visibility_notes.txt"
 MANIFEST="$PERM_DIR/manifest.tsv"
@@ -76,7 +77,7 @@ RESTORE_STATUS="not_attempted"
 SELECTED_RUNTIME_MODE="full-uhid-input"
 BRIDGE_STABLE_PRE_DIABLO="no"
 
-mkdir -p "$RUN_DIR" "$PERM_DIR" "$MONITOR_DIR"
+mkdir -p "$RUN_DIR" "$PERM_DIR" "$MONITOR_DIR" "$UINPUT_MONITOR_DIR"
 exec > >(tee -a "$GUIDED_LOG") 2>&1
 
 TARGET_USER="${DS4_TEST_USER:-${SUDO_USER:-}}"
@@ -90,8 +91,8 @@ if ! id "$TARGET_USER" >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
-  echo "[guided] ERROR: v0.5.1 requires getfacl, setfacl, and sudo for ACL-only isolation."
-  echo "[guided] This v0.5.1 Diablo test is not valid yet. Install ACL tools or send this archive/log back."
+  echo "[guided] ERROR: v0.5.2 requires getfacl, setfacl, and sudo for ACL-only isolation."
+  echo "[guided] This v0.5.2 Diablo test is not valid yet. Install ACL tools or send this archive/log back."
   printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
   printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
   printf 'missing getfacl/setfacl/sudo\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
@@ -124,21 +125,21 @@ Expected real USB identity:
   HID_NAME=Sony Interactive Entertainment Wireless Controller
   bus_type=1
 
-v0.5.1 virtual identities:
+v0.5.2 virtual identities:
   UHID: BUS_USB / 054c:09cc with the captured USB descriptor and feature replies.
   uinput: BUS_USB / 054c:09cc evdev gamepad with normal axes and buttons.
 
-v0.5.1 isolation attempt:
+v0.5.2 isolation attempt:
   After the bridge opens the physical Bluetooth hidraw device, stable-default leaves that active hidraw node untouched and uses ACLs only for physical evdev/js nodes.
   Virtual UHID/uinput nodes are not restricted.
 
-v0.5.1 touchpad idle fix:
+v0.5.2 touchpad and input-path gate:
   UHID USB DS4 reports intentionally encode no active touchpad contacts and freeze the touchpad block until a correct touchpad conversion is implemented.
   The UHID virtual event node is externally monitored before Diablo.
 
 Known caveat:
   UHID still lives under /sys/devices/virtual/misc/uhid, not a real USB parent.
-  The v0.5.1 test checks whether a stable Bluetooth reader, uinput output, and externally clean UHID touchpad idle state let Proton/Diablo select the virtual outputs.
+  The v0.5.2 test allows identity-only UHID without an input event node and requires validated uinput gameplay events before Steam Tester/Diablo.
 EOF
 
 printf 'kind\tnode\tsyspath\tacl_file\tstat_file\n' >"$MANIFEST"
@@ -263,7 +264,7 @@ kind_count() {
 
 write_result_summary() {
   {
-    echo "DS4 v0.5.1 guided result summary"
+    echo "DS4 v0.5.2 guided result summary"
     echo "timestamp=$TIMESTAMP"
     echo "target_user=$TARGET_USER"
     echo "guided_mode=$GUIDED_MODE"
@@ -290,7 +291,7 @@ write_result_summary() {
       echo "bridge_status=unavailable"
     fi
     echo
-    echo "[v0.5.1 touchpad checks]"
+    echo "[v0.5.2 touchpad and input-path checks]"
     echo "touchpad_neutralization_enabled=$(status_value touchpad_neutralization_enabled)"
     echo "touchpad_no_touch_encoding=$(status_value touchpad_no_touch_encoding)"
     echo "touchpad_mode=$(status_value touchpad_mode)"
@@ -301,6 +302,14 @@ write_result_summary() {
     echo "uhid_event_touchpad_idle_clean=$(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null || echo unknown)"
     echo "uhid_event_touchpad_events_seen=$(cat "$RUN_DIR/uhid_event_touchpad_events_seen.txt" 2>/dev/null || echo 0)"
     echo "uhid_event_touchpad_event_samples=$(cat "$RUN_DIR/uhid_event_touchpad_event_samples.txt" 2>/dev/null || echo none)"
+    echo "uhid_event_monitor_status=$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null || echo unknown)"
+    echo "identity_only_missing_uhid_event_node_allowed=$(cat "$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt" 2>/dev/null || echo no)"
+    echo "uinput_event_node=$(status_value uinput_event_node)"
+    echo "uinput_event_monitor_available=$(cat "$RUN_DIR/uinput_event_monitor_available.txt" 2>/dev/null || echo no)"
+    echo "uinput_events_seen=$(cat "$RUN_DIR/uinput_events_seen.txt" 2>/dev/null || echo 0)"
+    echo "uinput_buttons_sticks_validation=$(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null || echo unknown)"
+    echo "selected_input_path=$(cat "$RUN_DIR/selected_input_path.txt" 2>/dev/null || echo unknown)"
+    echo "diablo_test_allowed_reason=$(cat "$RUN_DIR/diablo_test_allowed_reason.txt" 2>/dev/null || echo none)"
     echo "usb_idle_template_captured=$(cat "$CAPTURE_ROOT/$TIMESTAMP/usb/idle_input/status.txt" 2>/dev/null | sed -n 's/^usb_idle_template_captured=//p' | tail -n 1 || echo unknown)"
     echo
     echo "[physical Bluetooth isolation]"
@@ -656,8 +665,13 @@ print_pre_diablo_check() {
   echo "  physical BT isolation active: $(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)"
   echo "  internal UHID touchpad decoder clean: $(status_value touchpad_idle_clean)"
   echo "  external UHID event touchpad idle clean: $(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null || echo unchecked)"
+  echo "  UHID event monitor status: $(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null || echo unchecked)"
   echo "  UHID touchpad idle samples checked: $(status_number touchpad_idle_samples_checked)"
   echo "  UHID active touch contacts emitted: $(status_number touchpad_active_contacts_emitted)"
+  echo "  uinput event node: $(status_value uinput_event_node)"
+  echo "  uinput event monitor available: $(cat "$RUN_DIR/uinput_event_monitor_available.txt" 2>/dev/null || echo unchecked)"
+  echo "  uinput events seen: $(cat "$RUN_DIR/uinput_events_seen.txt" 2>/dev/null || echo 0)"
+  echo "  uinput buttons/sticks validation: $(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null || echo unchecked)"
   echo "  active physical hidraw restricted: $(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)"
   echo "  selected runtime mode: $SELECTED_RUNTIME_MODE"
 }
@@ -684,12 +698,26 @@ monitor_uhid_touchpad_idle() {
   output_dir="$MONITOR_DIR/$runtime_mode"
   mkdir -p "$output_dir"
   if [ -z "$event_node" ]; then
-    echo "[guided] ERROR: could not find UHID virtual DS4 event node for external touchpad monitor"
-    printf 'no\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
+    printf '0\n' >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
+    printf 'none\n' >"$RUN_DIR/uhid_event_touchpad_event_samples.txt"
+    if [ "$runtime_mode" = "identity-only-uhid" ] &&
+      [ "$(status_value uhid_identity_only)" = "true" ] &&
+      [ "$(status_value uinput_ready)" = "true" ]; then
+      echo "[guided] UHID is running as identity-only. No UHID input event node is required. Gameplay input will be tested through the uinput event node."
+      printf 'not_applicable_identity_only\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
+      printf 'not_applicable_identity_only\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+      printf 'yes\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
+      return 0
+    fi
+    echo "[guided] Full UHID event monitor unavailable: no UHID virtual DS4 event node was found. Trying identity-only mode."
+    printf 'unavailable\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
     printf '0\n' >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
     printf 'missing UHID event node\n' >"$RUN_DIR/uhid_event_touchpad_invalid_reason.txt"
+    printf 'missing\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+    printf 'no\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
     return 1
   fi
+  printf 'no\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
   printf '%s\n' "$event_node" >"$RUN_DIR/uhid_event_node.txt"
   echo
   echo "[guided] External UHID event touchpad idle monitor"
@@ -717,7 +745,60 @@ monitor_uhid_touchpad_idle() {
   printf '%s\n' "${samples:-$output_dir/touchpad-events.txt}" >"$RUN_DIR/uhid_event_touchpad_event_samples.txt"
   echo "[guided] UHID event touchpad idle clean: ${clean:-no}"
   echo "[guided] UHID event touchpad events seen: ${events:-0}"
-  [ "${clean:-no}" = "yes" ]
+  if [ "${clean:-no}" = "yes" ]; then
+    printf 'clean\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+    return 0
+  fi
+  if [ "$runtime_mode" = "full-uhid-input" ]; then
+    printf 'full_mode_dirty\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+  else
+    printf 'identity_only_dirty\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+  fi
+  return 1
+}
+
+validate_uinput_activity() {
+  local event_node probe_bin output_dir status_file available events validation samples
+  event_node="$(status_value uinput_event_node)"
+  output_dir="$UINPUT_MONITOR_DIR/$SELECTED_RUNTIME_MODE"
+  mkdir -p "$output_dir"
+  if [ -z "$event_node" ] || [ ! -e "$event_node" ]; then
+    echo "[guided] ERROR: uinput event node is unavailable: ${event_node:-unknown}"
+    printf 'no\n' >"$RUN_DIR/uinput_event_monitor_available.txt"
+    printf '0\n' >"$RUN_DIR/uinput_events_seen.txt"
+    printf 'fail\n' >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
+    return 1
+  fi
+  printf '%s\n' "$event_node" >"$RUN_DIR/uinput_event_node.txt"
+  probe_bin="$(find_probe_binary || true)"
+  if [ -z "$probe_bin" ]; then
+    echo "[guided] ERROR: probe binary unavailable; cannot validate uinput events"
+    printf 'no\n' >"$RUN_DIR/uinput_event_monitor_available.txt"
+    printf '0\n' >"$RUN_DIR/uinput_events_seen.txt"
+    printf 'unknown\n' >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
+    return 1
+  fi
+  echo
+  echo "[guided] uinput gameplay-path validation"
+  echo "[guided] Move both sticks and press a few controller buttons for the next 7 seconds."
+  "$probe_bin" monitor-input-events \
+    --event "$event_node" \
+    --output-dir "$output_dir" \
+    --duration-ms 7000 \
+    >"$output_dir/monitor.log" 2>&1
+  status_file="$output_dir/status.txt"
+  available="$(sed -n 's/^uinput_event_monitor_available=//p' "$status_file" 2>/dev/null | tail -n 1)"
+  events="$(sed -n 's/^uinput_events_seen=//p' "$status_file" 2>/dev/null | tail -n 1)"
+  validation="$(sed -n 's/^uinput_buttons_sticks_validation=//p' "$status_file" 2>/dev/null | tail -n 1)"
+  samples="$(sed -n 's/^uinput_event_samples=//p' "$status_file" 2>/dev/null | tail -n 1)"
+  printf '%s\n' "${available:-no}" >"$RUN_DIR/uinput_event_monitor_available.txt"
+  printf '%s\n' "${events:-0}" >"$RUN_DIR/uinput_events_seen.txt"
+  printf '%s\n' "${validation:-unknown}" >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
+  printf '%s\n' "${samples:-$output_dir/input-events.txt}" >"$RUN_DIR/uinput_event_samples.txt"
+  echo "[guided] uinput event monitor available: ${available:-no}"
+  echo "[guided] uinput events seen: ${events:-0}"
+  echo "[guided] uinput buttons/sticks validation: ${validation:-unknown}"
+  [ "${available:-no}" = "yes" ] && [ "${validation:-unknown}" = "pass" ]
 }
 
 pre_diablo_stability_gate() {
@@ -734,7 +815,9 @@ pre_diablo_stability_gate() {
     sleep 1
   done
   if [ "$(status_value uhid_ready)" = "true" ] &&
+    [ -n "$(status_value uhid_hidraw_nodes)" ] &&
     [ "$(status_value uinput_ready)" = "true" ] &&
+    [ -n "$(status_value uinput_event_node)" ] &&
     [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
     [ "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" != "yes" ]; then
     printf 'yes\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
@@ -744,12 +827,17 @@ pre_diablo_stability_gate() {
     startup_failed "bridge stability checks did not pass before Diablo IV"
     return 1
   fi
-  if monitor_uhid_touchpad_idle "$runtime_mode"; then
+  if ! monitor_uhid_touchpad_idle "$runtime_mode"; then
     print_pre_diablo_check
-    return 0
+    return 1
+  fi
+  if ! validate_uinput_activity; then
+    print_pre_diablo_check
+    printf 'no\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
+    return 1
   fi
   print_pre_diablo_check
-  return 1
+  return 0
 }
 
 verify_virtual_nodes_present() {
@@ -780,7 +868,7 @@ verify_virtual_nodes_present() {
 
 isolation_failed() {
   local reason="$1"
-  echo "[guided] ERROR: v0.5.1 was not a valid Diablo test because physical Bluetooth isolation failed: $reason"
+  echo "[guided] ERROR: v0.5.2 was not a valid Diablo test because physical Bluetooth isolation failed: $reason"
   printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
   printf 'no\n' >"$RUN_DIR/physical_isolation_success.txt"
   printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
@@ -792,16 +880,27 @@ isolation_failed() {
   finish_archive
 }
 
+uhid_event_gate_accepted() {
+  local monitor_status
+  monitor_status="$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null)"
+  [ "$monitor_status" = "clean" ] || [ "$monitor_status" = "not_applicable_identity_only" ]
+}
+
 ensure_probe_alive() {
   if [ -n "$PROBE_PID" ] &&
     kill -0 "$PROBE_PID" >/dev/null 2>&1 &&
     [ "$(status_value uhid_ready)" = "true" ] &&
+    [ -n "$(status_value uhid_hidraw_nodes)" ] &&
     [ "$(status_value uinput_ready)" = "true" ] &&
+    [ -n "$(status_value uinput_event_node)" ] &&
+    [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
+    [ "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" != "yes" ] &&
     [ "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null)" = "yes" ] &&
-    [ "$(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null)" = "yes" ]; then
+    [ "$(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null)" = "pass" ] &&
+    uhid_event_gate_accepted; then
     return 0
   fi
-  startup_failed "probe, bridge, physical Bluetooth isolation, or external UHID touchpad idle state failed during the Diablo IV test"
+  startup_failed "probe, bridge, physical Bluetooth isolation, external UHID event status, or uinput validation failed during the Diablo IV test"
   return 1
 }
 
@@ -839,7 +938,7 @@ if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 
   exit 1
 fi
 
-echo "DS4 Bluetooth/USB Probe Guided Test v0.5.1"
+echo "DS4 Bluetooth/USB Probe Guided Test v0.5.2"
 echo "========================================"
 echo
 echo "This script collects USB/Bluetooth identity, starts the UHID + uinput bridge,"
@@ -871,8 +970,13 @@ if ! restrict_physical_nodes; then
 fi
 
 if ! pre_diablo_stability_gate full-uhid-input; then
-  if [ "$(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null)" = "no" ]; then
-    echo "[guided] Full UHID input still emits touchpad events at idle; trying identity-only UHID fallback."
+  full_monitor_status="$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null)"
+  if [ "$full_monitor_status" = "full_mode_dirty" ] || [ "$full_monitor_status" = "missing" ]; then
+    if [ "$full_monitor_status" = "missing" ]; then
+      echo "[guided] Full UHID event monitor is unavailable; trying identity-only UHID fallback."
+    else
+      echo "[guided] Full UHID input emits touchpad events at idle; trying identity-only UHID fallback."
+    fi
     stop_probe
     restore_permissions || true
     if ! start_probe identity-only-uhid; then
@@ -882,15 +986,18 @@ if ! pre_diablo_stability_gate full-uhid-input; then
       exit 1
     fi
     if ! pre_diablo_stability_gate identity-only-uhid; then
-      echo "[guided] ERROR: UHID touchpad bug is still not fixed. The Diablo IV test will not continue."
+      echo "[guided] ERROR: identity-only UHID + uinput readiness validation did not pass. The Diablo IV test will not continue."
       printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-      printf 'UHID event touchpad idle monitor failed in full and identity-only modes\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
+      printf 'identity-only UHID + uinput readiness validation failed\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
       stop_probe
       restore_permissions || true
       copy_summaries
       finish_archive
       exit 1
     fi
+  elif [ "$full_monitor_status" = "clean" ]; then
+    startup_failed "uinput gameplay input validation did not pass"
+    exit 1
   else
     exit 1
   fi
@@ -898,6 +1005,13 @@ fi
 
 printf 'yes\n' >"$RUN_DIR/valid_diablo_test.txt"
 printf '%s\n' "$SELECTED_RUNTIME_MODE" >"$RUN_DIR/selected_runtime_mode.txt"
+if [ "$SELECTED_RUNTIME_MODE" = "identity-only-uhid" ]; then
+  printf 'uinput\n' >"$RUN_DIR/selected_input_path.txt"
+  printf 'identity-only UHID + uinput ready\n' >"$RUN_DIR/diablo_test_allowed_reason.txt"
+else
+  printf 'uhid+uinput\n' >"$RUN_DIR/selected_input_path.txt"
+  printf 'full UHID input clean + uinput ready\n' >"$RUN_DIR/diablo_test_allowed_reason.txt"
+fi
 
 echo
 echo "Step 5:"

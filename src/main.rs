@@ -112,6 +112,11 @@ mod linux {
             output_dir: PathBuf,
             duration_ms: u64,
         },
+        MonitorInputEvents {
+            event: PathBuf,
+            output_dir: PathBuf,
+            duration_ms: u64,
+        },
     }
 
     #[derive(Debug)]
@@ -305,6 +310,11 @@ mod linux {
                 output_dir,
                 duration_ms,
             } => monitor_touchpad_events(&event, &output_dir, duration_ms),
+            Command::MonitorInputEvents {
+                event,
+                output_dir,
+                duration_ms,
+            } => monitor_input_events(&event, &output_dir, duration_ms),
             Command::Run(config) => run_device(config),
         }
     }
@@ -322,7 +332,7 @@ mod linux {
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
         let touchpad_template = load_touchpad_template(&config);
-        status.set("probe_version", "0.5.1");
+        status.set("probe_version", "0.5.2");
         status.set("output_mode", config.output_mode.as_str());
         status.set("touchpad_mode", config.touchpad_mode.as_str());
         status.set("touchpad_template_source", &touchpad_template.source);
@@ -1437,6 +1447,100 @@ mod linux {
         }
     }
 
+    fn monitor_input_events(
+        event: &Path,
+        output_dir: &Path,
+        duration_ms: u64,
+    ) -> Result<(), AnyError> {
+        fs::create_dir_all(output_dir)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(event)?;
+        println!(
+            "[input-monitor] event={} duration_ms={duration_ms}",
+            event.display()
+        );
+        let deadline = Instant::now() + Duration::from_millis(duration_ms.max(100));
+        let mut event_count = 0_u32;
+        let mut sample_lines = Vec::new();
+        while Instant::now() < deadline {
+            match read_input_event(&mut file) {
+                Ok(Some(input_event)) => {
+                    if let Some(label) = gamepad_activity_event_label(&input_event) {
+                        event_count += 1;
+                        let line = format!(
+                            "type=0x{:04x} code=0x{:04x} value={} label={label}",
+                            input_event.event_type, input_event.code, input_event.value
+                        );
+                        if sample_lines.len() < 100 {
+                            sample_lines.push(line.clone());
+                        }
+                        println!("[input-monitor] gamepad_event {line}");
+                    }
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let validation = if event_count > 0 { "pass" } else { "fail" };
+        fs::write(
+            output_dir.join("input-events.txt"),
+            if sample_lines.is_empty() {
+                "no gamepad activity events seen\n".to_string()
+            } else {
+                format!("{}\n", sample_lines.join("\n"))
+            },
+        )?;
+        fs::write(
+            output_dir.join("status.txt"),
+            format!(
+                "uinput_event_monitor_available=yes\nuinput_events_seen={event_count}\nuinput_buttons_sticks_validation={validation}\nuinput_event_samples={}\n",
+                output_dir.join("input-events.txt").display()
+            ),
+        )?;
+        println!(
+            "[input-monitor] uinput_events_seen={event_count} validation={validation}"
+        );
+        Ok(())
+    }
+
+    fn gamepad_activity_event_label(event: &InputEvent) -> Option<&'static str> {
+        if event.event_type == EV_KEY
+            && matches!(
+                event.code,
+                BTN_SOUTH
+                    | BTN_EAST
+                    | BTN_NORTH
+                    | BTN_WEST
+                    | BTN_TL
+                    | BTN_TR
+                    | BTN_TL2
+                    | BTN_TR2
+                    | BTN_SELECT
+                    | BTN_START
+                    | BTN_MODE
+                    | BTN_THUMBL
+                    | BTN_THUMBR
+            )
+        {
+            return Some("gamepad-button");
+        }
+        if event.event_type == EV_ABS
+            && matches!(
+                event.code,
+                ABS_X | ABS_Y | ABS_Z | ABS_RX | ABS_RY | ABS_RZ | ABS_HAT0X | ABS_HAT0Y
+            )
+        {
+            return Some("gamepad-axis");
+        }
+        None
+    }
+
     fn hidiocgfeature(size: usize) -> libc::c_ulong {
         const IOC_READ: libc::c_ulong = 2;
         const IOC_WRITE: libc::c_ulong = 1;
@@ -1507,6 +1611,27 @@ mod linux {
                 }
             }
             return Ok(Some(Command::MonitorTouchpadEvents {
+                event: event.ok_or_else(|| io::Error::other("--event is required"))?,
+                output_dir: output_dir.ok_or_else(|| io::Error::other("--output-dir is required"))?,
+                duration_ms,
+            }));
+        }
+        if args.peek().is_some_and(|arg| arg == "monitor-input-events") {
+            let _ = args.next();
+            let mut event = None;
+            let mut output_dir = None;
+            let mut duration_ms = 7000;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--event" => event = Some(PathBuf::from(next_value(&mut args, "--event")?)),
+                    "--output-dir" => {
+                        output_dir = Some(PathBuf::from(next_value(&mut args, "--output-dir")?))
+                    }
+                    "--duration-ms" => duration_ms = next_value(&mut args, &arg)?.parse()?,
+                    _ => return Err(io::Error::other(format!("unknown monitor-input-events argument {arg}")).into()),
+                }
+            }
+            return Ok(Some(Command::MonitorInputEvents {
                 event: event.ok_or_else(|| io::Error::other("--event is required"))?,
                 output_dir: output_dir.ok_or_else(|| io::Error::other("--output-dir is required"))?,
                 duration_ms,
@@ -2306,7 +2431,7 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.5.1
+            "ds4-bt-usb-probe 0.5.2
 
 Commands:
   ds4-bt-usb-probe [options]
@@ -2314,6 +2439,7 @@ Commands:
   ds4-bt-usb-probe capture-features --hidraw <path> --output-dir <dir>
   ds4-bt-usb-probe capture-idle-input --hidraw <path> --output-dir <dir> [--duration-ms <n>]
   ds4-bt-usb-probe monitor-touchpad-events --event <path> --output-dir <dir> [--duration-ms <n>]
+  ds4-bt-usb-probe monitor-input-events --event <path> --output-dir <dir> [--duration-ms <n>]
 "
         );
     }
@@ -2485,6 +2611,20 @@ Commands:
             assert_eq!(touchpad_event_label(&event), Some("ABS_MT_POSITION_Y"));
             event = input_event(EV_ABS, ABS_X, 128);
             assert_eq!(touchpad_event_label(&event), None);
+        }
+
+        #[test]
+        fn gamepad_activity_classifier_ignores_unrelated_events() {
+            let mut event = input_event(EV_KEY, BTN_SOUTH, 1);
+            assert_eq!(gamepad_activity_event_label(&event), Some("gamepad-button"));
+            event = input_event(EV_ABS, ABS_RX, 200);
+            assert_eq!(gamepad_activity_event_label(&event), Some("gamepad-axis"));
+            event = input_event(EV_SYN, SYN_REPORT, 0);
+            assert_eq!(gamepad_activity_event_label(&event), None);
+            event = input_event(EV_ABS, ABS_MT_POSITION_X, 100);
+            assert_eq!(gamepad_activity_event_label(&event), None);
+            event = input_event(EV_KEY, BTN_TOUCH, 1);
+            assert_eq!(gamepad_activity_event_label(&event), None);
         }
 
         #[test]

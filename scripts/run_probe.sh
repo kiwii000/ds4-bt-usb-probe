@@ -163,7 +163,7 @@ if [ "$MODE" != "probe" ]; then
     args+=(--uhid-identity-only)
   fi
   if [ "$MODE" = "both" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
-    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5.1 default Diablo gate will fail"
+    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5.2 default Diablo gate will fail"
     echo "[run_probe] Try: sudo modprobe uinput"
   fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"
