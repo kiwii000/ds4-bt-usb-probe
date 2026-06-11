@@ -901,6 +901,23 @@ printf '%s\n' "$SELECTED_RUNTIME_MODE" >"$RUN_DIR/selected_runtime_mode.txt"
 
 echo
 echo "Step 5:"
+echo "Before launching Diablo IV, open Steam Controller Tester for this controller."
+echo "Check whether Steam detects the controller, whether Steam Controller Tester shows a permanent touchpad contact, whether the touchpad looks idle/clean, and whether buttons/sticks respond."
+if ! wait_for_enter_while_probe_alive "Press Enter after you have checked Steam Controller Tester."; then
+  exit 1
+fi
+
+if ! ensure_probe_alive; then
+  exit 1
+fi
+
+ask_result "Steam detected controller" "steam_controller_detected.txt"
+ask_result "Steam Tester permanent touchpad contact" "steam_tester_permanent_touchpad_contact.txt"
+ask_result "Steam Tester touchpad looks idle/clean" "steam_tester_touchpad_idle_clean.txt"
+ask_result "Steam Tester buttons/sticks worked" "steam_tester_buttons_sticks_worked.txt"
+
+echo
+echo "Step 6:"
 echo "Now launch Steam, make sure Steam Input is disabled for Diablo IV, launch Diablo IV, and check whether PlayStation glyphs appear."
 if ! wait_for_enter_while_probe_alive "Press Enter after you have checked Diablo IV."; then
   exit 1
@@ -910,9 +927,6 @@ if ! ensure_probe_alive; then
   exit 1
 fi
 
-ask_result "Did Steam detect the controller?" "steam_controller_detected.txt"
-ask_result "In Steam controller tester, is there still a permanent touchpad contact?" "steam_permanent_touchpad_contact.txt"
-ask_result "Does the script say UHID event touchpad idle clean?" "script_uhid_event_touchpad_idle_clean.txt"
 ask_result "Did Diablo IV detect a controller?" "diablo_controller_detected.txt"
 ask_result "Did PlayStation glyphs appear?" "diablo_playstation_glyphs.txt"
 ask_result "Did input work?" "diablo_input_worked.txt"
