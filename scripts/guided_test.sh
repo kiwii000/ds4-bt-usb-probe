@@ -63,10 +63,10 @@ if ! id "$TARGET_USER" >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
-  echo "[guided] ERROR: v0.4 requires getfacl, setfacl, and sudo for ACL-only isolation."
-  echo "[guided] This v0.4 Diablo test is not valid yet. Install ACL tools or send this archive/log back."
-  printf 'no\n' >"$RUN_DIR/v0.4_valid_diablo_test.txt"
-  printf 'missing getfacl/setfacl/sudo\n' >"$RUN_DIR/v0.4_invalid_reason.txt"
+  echo "[guided] ERROR: v0.5 requires getfacl, setfacl, and sudo for ACL-only isolation."
+  echo "[guided] This v0.5 Diablo test is not valid yet. Install ACL tools or send this archive/log back."
+  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
+  printf 'missing getfacl/setfacl/sudo\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
 fi
 
 cat >"$RUN_DIR/expected_virtual_identity.txt" <<'EOF'
@@ -96,17 +96,20 @@ Expected real USB identity:
   HID_NAME=Sony Interactive Entertainment Wireless Controller
   bus_type=1
 
-v0.4 virtual identities:
+v0.5 virtual identities:
   UHID: BUS_USB / 054c:09cc with the captured USB descriptor and feature replies.
   uinput: BUS_USB / 054c:09cc evdev gamepad with normal axes and buttons.
 
-v0.4 isolation attempt:
+v0.5 isolation attempt:
   After the bridge opens the physical Bluetooth hidraw device, the guided script uses ACLs to revoke the normal Steam user's access to the original physical Bluetooth DS4 nodes only.
   Virtual UHID/uinput nodes are not restricted.
 
+v0.5 touchpad idle fix:
+  UHID USB DS4 reports intentionally encode no active touchpad contacts until a correct touchpad conversion is implemented.
+
 Known caveat:
   UHID still lives under /sys/devices/virtual/misc/uhid, not a real USB parent.
-  The v0.4 test checks whether hiding the ignored physical Bluetooth path lets Proton/Diablo select the virtual outputs.
+  The v0.5 test checks whether hiding the ignored physical Bluetooth path and neutralizing UHID touch contacts lets Proton/Diablo select the virtual outputs.
 EOF
 
 printf 'kind\tnode\tsyspath\tacl_file\tstat_file\n' >"$MANIFEST"
@@ -209,11 +212,11 @@ kind_count() {
 
 write_result_summary() {
   {
-    echo "DS4 v0.4 guided result summary"
+    echo "DS4 v0.5 guided result summary"
     echo "timestamp=$TIMESTAMP"
     echo "target_user=$TARGET_USER"
-    echo "v0.4_valid_diablo_test=$(cat "$RUN_DIR/v0.4_valid_diablo_test.txt" 2>/dev/null || echo unknown)"
-    echo "v0.4_invalid_reason=$(cat "$RUN_DIR/v0.4_invalid_reason.txt" 2>/dev/null || echo none)"
+    echo "v0.5_valid_diablo_test=$(cat "$RUN_DIR/v0.5_valid_diablo_test.txt" 2>/dev/null || echo unknown)"
+    echo "v0.5_invalid_reason=$(cat "$RUN_DIR/v0.5_invalid_reason.txt" 2>/dev/null || echo none)"
     echo "permission_restore_status=$RESTORE_STATUS"
     echo
     for mode in usb bluetooth; do
@@ -231,6 +234,13 @@ write_result_summary() {
     else
       echo "bridge_status=unavailable"
     fi
+    echo
+    echo "[v0.5 touchpad idle check]"
+    echo "touchpad_neutralization_enabled=$(status_value touchpad_neutralization_enabled)"
+    echo "touchpad_no_touch_encoding=$(status_value touchpad_no_touch_encoding)"
+    echo "touchpad_idle_clean=$(status_value touchpad_idle_clean)"
+    echo "touchpad_idle_samples_checked=$(status_number touchpad_idle_samples_checked)"
+    echo "touchpad_active_contacts_emitted=$(status_number touchpad_active_contacts_emitted)"
     echo
     echo "[physical Bluetooth isolation]"
     echo "physical_bt_nodes_found=$(line_count "$DISCOVERED_NODES")"
@@ -272,8 +282,8 @@ write_result_summary() {
 cleanup_on_signal() {
   echo
   echo "[guided] Interrupted; restoring permissions and cleaning up."
-  printf 'no\n' >"$RUN_DIR/v0.4_valid_diablo_test.txt"
-  printf 'interrupted\n' >"$RUN_DIR/v0.4_invalid_reason.txt"
+  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
+  printf 'interrupted\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
   restore_permissions || true
   stop_probe
   copy_summaries
@@ -353,6 +363,10 @@ start_probe() {
       startup_failed "uinput fallback failed"
       return 1
     fi
+    if [ "$(status_value touchpad_idle_clean)" = "false" ]; then
+      startup_failed "UHID touchpad idle state is not clean"
+      return 1
+    fi
     if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
       startup_failed "probe process exited early"
       return 1
@@ -364,22 +378,24 @@ start_probe() {
       [ "$(status_number bluetooth_reports_read)" -gt 0 ] &&
       [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
       [ "$(status_number uhid_reports_emitted)" -gt 0 ] &&
-      [ "$(status_number uinput_events_emitted)" -gt 0 ]; then
+      [ "$(status_number uinput_events_emitted)" -gt 0 ] &&
+      [ "$(status_value touchpad_idle_clean)" = "true" ] &&
+      [ "$(status_number touchpad_idle_samples_checked)" -gt 0 ]; then
       echo "[guided] Probe startup confirmed."
       return 0
     fi
     sleep 1
   done
 
-  startup_failed "UHID, uinput, physical Bluetooth hidraw ownership, and active forwarding were not confirmed after 30 seconds"
+  startup_failed "UHID, uinput, physical Bluetooth hidraw ownership, active forwarding, and clean UHID touchpad idle state were not confirmed after 30 seconds"
   return 1
 }
 
 startup_failed() {
   local reason="$1"
   echo "[guided] ERROR: $reason. The Diablo IV test will not continue."
-  printf 'no\n' >"$RUN_DIR/v0.4_valid_diablo_test.txt"
-  printf '%s\n' "$reason" >"$RUN_DIR/v0.4_invalid_reason.txt"
+  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
+  printf '%s\n' "$reason" >"$RUN_DIR/v0.5_invalid_reason.txt"
   printf '%s\n' "$reason" >"$RUN_DIR/guided_gate_result.txt"
   printf 'probe_start_failed: %s\n' "$reason" >"$RUN_DIR/diablo_test_result.txt"
   echo "[guided] probe.log follows:"
@@ -507,10 +523,37 @@ restrict_physical_nodes() {
   fi
 
   printf 'yes\n' >"$RUN_DIR/physical_isolation_success.txt"
-  printf 'yes\n' >"$RUN_DIR/v0.4_valid_diablo_test.txt"
-  printf 'none\n' >"$RUN_DIR/v0.4_invalid_reason.txt"
+  printf 'yes\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
+  printf 'none\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
   printf 'ready\n' >"$RUN_DIR/guided_gate_result.txt"
   echo "[guided] Physical Bluetooth isolation confirmed."
+}
+
+print_pre_diablo_check() {
+  echo
+  echo "Pre-Diablo readiness check:"
+  echo "  UHID virtual DS4 ready: $(status_value uhid_ready)"
+  echo "  uinput fallback ready: $(status_value uinput_ready)"
+  if [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ]; then
+    echo "  Bluetooth reports forwarding: yes"
+  else
+    echo "  Bluetooth reports forwarding: no"
+  fi
+  echo "  physical BT isolation active: $(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)"
+  echo "  UHID touchpad idle state clean: $(status_value touchpad_idle_clean)"
+  echo "  UHID touchpad idle samples checked: $(status_number touchpad_idle_samples_checked)"
+  echo "  UHID active touch contacts emitted: $(status_number touchpad_active_contacts_emitted)"
+}
+
+require_touchpad_idle_clean() {
+  print_pre_diablo_check
+  if [ "$(status_value touchpad_idle_clean)" != "true" ] ||
+    [ "$(status_number touchpad_idle_samples_checked)" -le 0 ] ||
+    [ "$(status_number touchpad_active_contacts_emitted)" -ne 0 ]; then
+    startup_failed "UHID touchpad idle state is not clean"
+    return 1
+  fi
+  return 0
 }
 
 verify_virtual_nodes_present() {
@@ -541,10 +584,10 @@ verify_virtual_nodes_present() {
 
 isolation_failed() {
   local reason="$1"
-  echo "[guided] ERROR: v0.4 was not a valid Diablo test because physical Bluetooth isolation failed: $reason"
+  echo "[guided] ERROR: v0.5 was not a valid Diablo test because physical Bluetooth isolation failed: $reason"
   printf 'no\n' >"$RUN_DIR/physical_isolation_success.txt"
-  printf 'no\n' >"$RUN_DIR/v0.4_valid_diablo_test.txt"
-  printf 'physical isolation failed: %s\n' "$reason" >"$RUN_DIR/v0.4_invalid_reason.txt"
+  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
+  printf 'physical isolation failed: %s\n' "$reason" >"$RUN_DIR/v0.5_invalid_reason.txt"
   printf 'physical isolation failed: %s\n' "$reason" >"$RUN_DIR/guided_gate_result.txt"
   restore_permissions || true
   stop_probe
@@ -557,10 +600,11 @@ ensure_probe_alive() {
     kill -0 "$PROBE_PID" >/dev/null 2>&1 &&
     [ "$(status_value uhid_ready)" = "true" ] &&
     [ "$(status_value uinput_ready)" = "true" ] &&
-    [ "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null)" = "yes" ]; then
+    [ "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null)" = "yes" ] &&
+    [ "$(status_value touchpad_idle_clean)" = "true" ]; then
     return 0
   fi
-  startup_failed "probe, bridge, or physical Bluetooth isolation failed during the Diablo IV test"
+  startup_failed "probe, bridge, physical Bluetooth isolation, or UHID touchpad idle state failed during the Diablo IV test"
   return 1
 }
 
@@ -598,7 +642,7 @@ if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 
   exit 1
 fi
 
-echo "DS4 Bluetooth/USB Probe Guided Test v0.4"
+echo "DS4 Bluetooth/USB Probe Guided Test v0.5"
 echo "========================================"
 echo
 echo "This script collects USB/Bluetooth identity, starts the UHID + uinput bridge,"
@@ -629,6 +673,10 @@ if ! restrict_physical_nodes; then
   exit 1
 fi
 
+if ! require_touchpad_idle_clean; then
+  exit 1
+fi
+
 echo
 echo "Step 5:"
 echo "Now launch Steam, make sure Steam Input is disabled for Diablo IV, launch Diablo IV, and check whether PlayStation glyphs appear."
@@ -641,10 +689,11 @@ if ! ensure_probe_alive; then
 fi
 
 ask_result "Did Steam detect the controller?" "steam_controller_detected.txt"
+ask_result "In Steam controller tester, is there still a permanent touchpad contact?" "steam_permanent_touchpad_contact.txt"
+ask_result "Does event27 still oscillate at idle?" "event27_idle_oscillation.txt"
 ask_result "Did Diablo IV detect a controller?" "diablo_controller_detected.txt"
 ask_result "Did PlayStation glyphs appear?" "diablo_playstation_glyphs.txt"
 ask_result "Did input work?" "diablo_input_worked.txt"
-ask_result "Was there duplicate input?" "diablo_duplicate_input.txt"
 
 stop_probe
 restore_permissions || true

@@ -140,7 +140,7 @@ echo "[run_probe] launching probe. Keep this terminal open during the Diablo IV 
 echo "[run_probe] probe effective user: $(id -u) (must be 0/root)"
 if [ "$MODE" != "probe" ]; then
   if [ "$MODE" = "both" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
-    echo "[run_probe] WARNING: no uinput device node is visible; the v0.4 default Diablo gate will fail"
+    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5 default Diablo gate will fail"
     echo "[run_probe] Try: sudo modprobe uinput"
   fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"

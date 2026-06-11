@@ -34,7 +34,7 @@ sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
-The guided script also attempts `modprobe uinput` when the required uinput fallback node is absent. v0.4 requires `getfacl` and `setfacl` for ACL-only physical Bluetooth isolation; it does not use chmod fallback. If isolation fails, it stops before Diablo IV and packages the failure archive.
+The guided script also attempts `modprobe uinput` when the required uinput fallback node is absent. v0.5 requires `getfacl` and `setfacl` for ACL-only physical Bluetooth isolation; it does not use chmod fallback. If isolation or the UHID touchpad idle self-check fails, it stops before Diablo IV and packages the failure archive.
 
 Emergency permission restore:
 
@@ -48,7 +48,7 @@ The preferred file to send back is:
 ds4-probe-results-<timestamp>.tar.gz
 ```
 
-Version 0.4 preserves the UHID Sony identity and required uinput evdev fallback, then temporarily hides the original physical Bluetooth DS4 from the Steam user with ACLs. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
+Version 0.5 preserves the UHID Sony identity and required uinput evdev fallback, temporarily hides the original physical Bluetooth DS4 from the Steam user with ACLs, and explicitly reports no active UHID DS4 touchpad contacts at idle. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
 
 The tester may also try the optional KDE/Bazzite desktop launcher:
 

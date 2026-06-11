@@ -270,7 +270,7 @@ mod linux {
         let uinput_version_source =
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
-        status.set("probe_version", "0.4.0");
+        status.set("probe_version", "0.5.0");
         status.set("output_mode", config.output_mode.as_str());
         status.set("uhid_ready", "false");
         status.set("uinput_required", (config.output_mode == OutputMode::Both).to_string());
@@ -281,6 +281,11 @@ mod linux {
         status.set("bluetooth_reports_forwarded", "0");
         status.set("uhid_reports_emitted", "0");
         status.set("uinput_events_emitted", "0");
+        status.set("touchpad_neutralization_enabled", "true");
+        status.set("touchpad_no_touch_encoding", "contact_bit7_inactive");
+        status.set("touchpad_idle_clean", "true");
+        status.set("touchpad_idle_samples_checked", "0");
+        status.set("touchpad_active_contacts_emitted", "0");
         status.set("get_report_eio", "0");
         status.set("running", "true");
         status.set("uhid_version", format!("0x{uhid_version:04x}"));
@@ -337,7 +342,7 @@ mod linux {
         println!("[probe] UHID_CREATE2 sent");
 
         let report = neutral_usb_ds4_report();
-        device.send_input_report(&report)?;
+        send_checked_uhid_report(&mut device, &report, &status, "initial-neutral")?;
         wait_for_virtual_device(
             &mut device,
             &state,
@@ -364,7 +369,7 @@ mod linux {
                 &status,
             )
         } else {
-            run_neutral_loop(&mut device, &config, report)
+            run_neutral_loop(&mut device, &config, report, &status)
         };
         if let Err(err) = &result {
             status.set("fatal_error", err.to_string());
@@ -377,6 +382,7 @@ mod linux {
         device: &mut UhidDevice,
         config: &Config,
         report: [u8; 64],
+        status: &StatusTracker,
     ) -> Result<(), AnyError> {
         println!(
             "[probe] sending neutral USB-style DS4 reports every {}ms",
@@ -384,7 +390,7 @@ mod linux {
         );
         let interval = Duration::from_millis(config.interval_ms.max(1));
         while RUNNING.load(Ordering::Relaxed) {
-            device.send_input_report(&report)?;
+            send_checked_uhid_report(device, &report, status, "neutral-loop")?;
             thread::sleep(interval);
         }
         device.destroy()?;
@@ -500,7 +506,7 @@ mod linux {
             }
             if poll_result == 0 || pollfd.revents & libc::POLLIN == 0 {
                 if last_keepalive.elapsed() >= Duration::from_millis(config.interval_ms.max(4)) {
-                    device.send_input_report(&neutral)?;
+                    send_checked_uhid_report(device, &neutral, status, "bridge-keepalive")?;
                     status.increment("uhid_reports_emitted", 1);
                     last_keepalive = Instant::now();
                 }
@@ -512,7 +518,12 @@ mod linux {
                     status.increment("bluetooth_reports_read", 1);
                     match translate_bluetooth_report(&buffer[..size]) {
                         Ok(translated) => {
-                            device.send_input_report(&translated.usb_report)?;
+                            send_checked_uhid_report(
+                                device,
+                                &translated.usb_report,
+                                status,
+                                "bridge-translated",
+                            )?;
                             status.increment("uhid_reports_emitted", 1);
                             if let Some(output) = uinput.as_mut() {
                                 let emitted =
@@ -558,12 +569,12 @@ mod linux {
         state: &Arc<Mutex<InitState>>,
         vid: u32,
         pid: u32,
-        neutral: &[u8],
+        neutral: &[u8; 64],
         status: &StatusTracker,
     ) -> Result<(), AnyError> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            device.send_input_report(neutral)?;
+            send_checked_uhid_report(device, neutral, status, "init-wait-neutral")?;
             let current = state.lock().map_err(|_| io::Error::other("init state lock poisoned"))?;
             if current.stopped || current.closed {
                 return Err(io::Error::other(format!(
@@ -664,7 +675,7 @@ mod linux {
             }
         }
 
-        fn increment(&self, key: &str, amount: u64) {
+        fn increment(&self, key: &str, amount: u64) -> u64 {
             if let Ok(mut values) = self.values.lock() {
                 let previous = values
                     .get(key)
@@ -675,6 +686,17 @@ mod linux {
                 if previous == 0 || next.is_multiple_of(100) {
                     self.flush_locked(&values);
                 }
+                next
+            } else {
+                0
+            }
+        }
+
+        fn number(&self, key: &str) -> u64 {
+            if let Ok(values) = self.values.lock() {
+                values.get(key).and_then(|value| value.parse::<u64>().ok()).unwrap_or(0)
+            } else {
+                0
             }
         }
 
@@ -1317,6 +1339,7 @@ mod linux {
             Some(_) => return Err("unsupported Bluetooth report id"),
             None => return Err("empty Bluetooth report"),
         }
+        neutralize_usb_ds4_touchpad(&mut output);
         Ok(TranslatedInput {
             gamepad: gamepad_state_from_usb_report(&output),
             usb_report: output,
@@ -1555,12 +1578,138 @@ mod linux {
         dirs.pop()
     }
 
+    const DS4_USB_REPORT_ID_OFFSET: usize = 0;
+    const DS4_USB_COMMON_START: usize = 1;
+    const DS4_USB_COMMON_LEN: usize = 32;
+    const DS4_USB_BUTTONS2_OFFSET: usize = 7;
+    const DS4_USB_TOUCHPAD_BUTTON_BIT: u8 = 0x02;
+    const DS4_USB_TOUCH_REPORT_COUNT_OFFSET: usize = DS4_USB_COMMON_START + DS4_USB_COMMON_LEN;
+    const DS4_USB_TOUCH_REPORTS_OFFSET: usize = DS4_USB_TOUCH_REPORT_COUNT_OFFSET + 1;
+    const DS4_USB_TOUCH_REPORT_LEN: usize = 9;
+    const DS4_TOUCH_CONTACT_INACTIVE: u8 = 0x80;
+    const DS4_TOUCH_CONTACT_OFFSETS: [usize; 6] = [35, 39, 44, 48, 53, 57];
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct DecodedTouchContact {
+        offset: usize,
+        inactive: bool,
+        tracking_id: u8,
+        x: u16,
+        y: u16,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct DecodedTouchpad {
+        active_contacts: usize,
+        contacts: Vec<DecodedTouchContact>,
+    }
+
     fn neutral_usb_ds4_report() -> [u8; 64] {
         let mut report = [0_u8; 64];
-        report[0] = 0x01;
+        report[DS4_USB_REPORT_ID_OFFSET] = 0x01;
         report[1..5].fill(0x80);
         report[5] = 0x08;
+        neutralize_usb_ds4_touchpad(&mut report);
         report
+    }
+
+    fn neutralize_usb_ds4_touchpad(report: &mut [u8; 64]) {
+        report[DS4_USB_BUTTONS2_OFFSET] &= !DS4_USB_TOUCHPAD_BUTTON_BIT;
+        report[DS4_USB_TOUCH_REPORT_COUNT_OFFSET] = 1;
+        let touch_data_end =
+            DS4_USB_TOUCH_REPORTS_OFFSET + DS4_USB_TOUCH_REPORT_LEN * 3;
+        report[DS4_USB_TOUCH_REPORTS_OFFSET..touch_data_end].fill(0);
+        for offset in DS4_TOUCH_CONTACT_OFFSETS {
+            report[offset] = DS4_TOUCH_CONTACT_INACTIVE;
+        }
+    }
+
+    fn decode_usb_ds4_touchpad(report: &[u8; 64]) -> DecodedTouchpad {
+        let contacts = DS4_TOUCH_CONTACT_OFFSETS
+            .iter()
+            .map(|offset| {
+                let contact = report[*offset];
+                let x = u16::from(report[*offset + 1])
+                    | (u16::from(report[*offset + 2] & 0x0f) << 8);
+                let y = (u16::from(report[*offset + 2] >> 4))
+                    | (u16::from(report[*offset + 3]) << 4);
+                DecodedTouchContact {
+                    offset: *offset,
+                    inactive: contact & DS4_TOUCH_CONTACT_INACTIVE != 0,
+                    tracking_id: contact & !DS4_TOUCH_CONTACT_INACTIVE,
+                    x,
+                    y,
+                }
+            })
+            .collect::<Vec<_>>();
+        let active_contacts = contacts.iter().filter(|contact| !contact.inactive).count();
+        DecodedTouchpad {
+            active_contacts,
+            contacts,
+        }
+    }
+
+    fn touchpad_contact_summary(decoded: &DecodedTouchpad) -> String {
+        decoded
+            .contacts
+            .iter()
+            .map(|contact| {
+                let state = if contact.inactive { "inactive" } else { "active" };
+                format!(
+                    "@{}:{state}:id={}:x={}:y={}",
+                    contact.offset, contact.tracking_id, contact.x, contact.y
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn send_checked_uhid_report(
+        device: &mut UhidDevice,
+        report: &[u8; 64],
+        status: &StatusTracker,
+        source: &str,
+    ) -> io::Result<()> {
+        device.send_input_report(report)?;
+        record_touchpad_idle_check(status, source, report);
+        Ok(())
+    }
+
+    fn record_touchpad_idle_check(status: &StatusTracker, source: &str, report: &[u8; 64]) {
+        let decoded = decode_usb_ds4_touchpad(report);
+        let sample = status.increment("touchpad_idle_samples_checked", 1);
+        if decoded.active_contacts == 0 {
+            if status.number("touchpad_active_contacts_emitted") == 0 {
+                status.set("touchpad_idle_clean", "true");
+            }
+        } else {
+            let active_total =
+                status.increment("touchpad_active_contacts_emitted", decoded.active_contacts as u64);
+            status.set("touchpad_idle_clean", "false");
+            println!(
+                "[touchpad] WARNING: emitted UHID report has {} active touch contacts; total_active_contacts={active_total}",
+                decoded.active_contacts
+            );
+        }
+        if sample <= 5 || decoded.active_contacts > 0 {
+            let key = format!("touchpad_idle_sample_{sample}");
+            let summary = touchpad_contact_summary(&decoded);
+            let touch_bytes = hex_all(
+                &report[DS4_USB_TOUCH_REPORT_COUNT_OFFSET
+                    ..DS4_USB_TOUCH_REPORTS_OFFSET + DS4_USB_TOUCH_REPORT_LEN * 3],
+            );
+            println!(
+                "[touchpad] sample={sample} source={source} active_contacts={} contacts={} touch_bytes={}",
+                decoded.active_contacts, summary, touch_bytes
+            );
+            status.set(
+                key,
+                format!(
+                    "source={source} active_contacts={} contacts={} touch_bytes={}",
+                    decoded.active_contacts, summary, touch_bytes
+                ),
+            );
+        }
     }
 
     fn fallback_ds4_usb_descriptor() -> &'static [u8] {
@@ -1732,7 +1881,7 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.4
+            "ds4-bt-usb-probe 0.5
 
 Commands:
   ds4-bt-usb-probe [options]
@@ -1798,26 +1947,63 @@ Commands:
         }
 
         #[test]
+        fn neutral_report_marks_all_touch_contacts_inactive() {
+            let report = neutral_usb_ds4_report();
+            assert_eq!(report[DS4_USB_TOUCH_REPORT_COUNT_OFFSET], 1);
+            assert_eq!(report[DS4_USB_BUTTONS2_OFFSET] & DS4_USB_TOUCHPAD_BUTTON_BIT, 0);
+            for offset in DS4_TOUCH_CONTACT_OFFSETS {
+                assert_eq!(report[offset] & DS4_TOUCH_CONTACT_INACTIVE, 0x80);
+            }
+            let decoded = decode_usb_ds4_touchpad(&report);
+            assert_eq!(decoded.active_contacts, 0);
+            assert!(decoded.contacts.iter().all(|contact| contact.inactive));
+        }
+
+        #[test]
         fn full_bluetooth_report_maps_common_controls() {
             let mut bt = [0_u8; 78];
             bt[0] = 0x11;
             for (index, byte) in bt[3..35].iter_mut().enumerate() {
                 *byte = index as u8;
             }
+            bt[9] |= DS4_USB_TOUCHPAD_BUTTON_BIT;
             let translated = translate_bluetooth_report(&bt).unwrap();
             assert_eq!(translated.usb_report[0], 0x01);
-            assert_eq!(&translated.usb_report[1..10], &bt[3..12]);
+            let mut expected_common = [0_u8; 9];
+            expected_common.copy_from_slice(&bt[3..12]);
+            expected_common[6] &= !DS4_USB_TOUCHPAD_BUTTON_BIT;
+            assert_eq!(&translated.usb_report[1..10], &expected_common);
             assert_eq!(
                 &translated.usb_report[10..],
                 &neutral_usb_ds4_report()[10..]
             );
+            assert_eq!(decode_usb_ds4_touchpad(&translated.usb_report).active_contacts, 0);
         }
 
         #[test]
         fn minimal_bluetooth_report_maps_basic_controls() {
-            let bt = [0x01, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            let bt = [0x01, 1, 2, 3, 4, 5, 6, 7 | DS4_USB_TOUCHPAD_BUTTON_BIT, 8, 9];
             let translated = translate_bluetooth_report(&bt).unwrap();
-            assert_eq!(&translated.usb_report[..10], &bt);
+            let mut expected = bt;
+            expected[7] &= !DS4_USB_TOUCHPAD_BUTTON_BIT;
+            assert_eq!(&translated.usb_report[..10], &expected);
+            assert_eq!(decode_usb_ds4_touchpad(&translated.usb_report).active_contacts, 0);
+        }
+
+        #[test]
+        fn touchpad_decoder_detects_intentionally_active_contact() {
+            let mut report = neutral_usb_ds4_report();
+            let offset = DS4_TOUCH_CONTACT_OFFSETS[0];
+            report[offset] = 0x01;
+            report[offset + 1] = 0x34;
+            report[offset + 2] = 0x52;
+            report[offset + 3] = 0x01;
+            let decoded = decode_usb_ds4_touchpad(&report);
+            assert_eq!(decoded.active_contacts, 1);
+            assert!(!decoded.contacts[0].inactive);
+            assert_eq!(decoded.contacts[0].tracking_id, 1);
+            assert_eq!(decoded.contacts[0].x, 0x234);
+            assert_eq!(decoded.contacts[0].y, 0x015);
         }
 
         #[test]

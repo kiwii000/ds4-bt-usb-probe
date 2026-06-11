@@ -1,10 +1,10 @@
 # ds4-bt-usb-probe
 
-`ds4-bt-usb-probe` v0.4 is an unconfirmed functional Linux attempt to make a Bluetooth DS4-compatible controller usable by Diablo IV as a USB-style PlayStation controller.
+`ds4-bt-usb-probe` v0.5 is an unconfirmed functional Linux attempt to make a Bluetooth DS4-compatible controller usable by Diablo IV as a USB-style PlayStation controller.
 
-> Will Diablo IV / Proton select the preserved virtual USB-style DS4/uinput outputs if the original physical Bluetooth DS4 is temporarily hidden from the Steam user?
+> Will Diablo IV / Proton select the preserved virtual USB-style DS4/uinput outputs if the original physical Bluetooth DS4 is temporarily hidden from the Steam user and the virtual UHID DS4 reports a clean idle touchpad state?
 
-It preserves the Sony-identifying UHID path, keeps the required uinput evdev gamepad fallback, and adds ACL-only isolation for the physical Bluetooth controller during the guided test. It does **not** implement the final daemon/service, rumble, gyro/touchpad forwarding, remapping, macros, profiles, Xbox/XInput, duplicate suppression, or autostart.
+It preserves the Sony-identifying UHID path, keeps the required uinput evdev gamepad fallback, keeps ACL-only isolation for the physical Bluetooth controller during the guided test, and neutralizes UHID DS4 touch contacts at idle. It does **not** implement the final daemon/service, rumble, real touchpad forwarding, remapping, macros, profiles, Xbox/XInput, duplicate suppression, or autostart.
 
 Target test machine:
 
@@ -28,7 +28,7 @@ bus_type=1
 USB-style input report 0x01
 ```
 
-The rejected Bluetooth mode appears as `HID_ID=0005:0000054C:000009CC`, `bus_type=2`, with full `0x11` / 78-byte Bluetooth reports. v0.4 keeps the working USB-visible UHID identity, keeps the BUS_USB uinput event device, and temporarily revokes the normal Steam user's ACL access to the original physical Bluetooth DS4 nodes after the bridge opens the physical hidraw input.
+The rejected Bluetooth mode appears as `HID_ID=0005:0000054C:000009CC`, `bus_type=2`, with full `0x11` / 78-byte Bluetooth reports. v0.5 keeps the working USB-visible UHID identity, keeps the BUS_USB uinput event device, temporarily revokes the normal Steam user's ACL access to the original physical Bluetooth DS4 nodes after the bridge opens the physical hidraw input, and explicitly marks UHID DS4 touch contacts inactive.
 
 UHID cannot create a real physical USB topology. This test still determines whether its USB bus identity and HID behavior are sufficient for Proton/Diablo IV.
 
@@ -50,6 +50,7 @@ UHID cannot create a real physical USB topology. This test still determines whet
   - centered sticks
   - neutral triggers
   - no buttons pressed
+  - no active touchpad contacts
 - Runs until Ctrl+C.
 - Answers known DS4 feature reports `0x02`, `0x12`, `0x81`, and `0xa3`, plus safe descriptor-declared feature fallbacks.
 - Rewrites the virtual pairing MAC in bridge mode to avoid duplicating the physical controller identity.
@@ -57,6 +58,7 @@ UHID cannot create a real physical USB topology. This test still determines whet
 - Emits the same basic controls to a uinput evdev gamepad with normal axes, hats, buttons, and `EV_SYN`.
 - Uses captured USB and input-event versions when available; otherwise UHID falls back to `0x0100` and uinput to `0x8111`.
 - In the default guided test, uses ACL-only isolation to hide physical Bluetooth DS4 hidraw/input/js nodes from the normal Steam user while leaving virtual UHID/uinput nodes alone.
+- In v0.5, does not forward real touchpad data. It intentionally sets DS4 touch contact bit 7 on the USB touch contact bytes so the virtual DS4 reports no active touch contact at idle.
 
 The fallback descriptor is only a backup. Because the controller may be PS4-compatible rather than original Sony, the USB descriptor captured from the real working USB mode is the preferred test input.
 
@@ -99,7 +101,7 @@ sudo modprobe uhid
 sudo ./scripts/guided_test.sh
 ```
 
-The guided script attempts `modprobe uinput` automatically when the required uinput node is absent. It also requires `getfacl` and `setfacl`; v0.4 does not use a chmod fallback for physical-device isolation.
+The guided script attempts `modprobe uinput` automatically when the required uinput node is absent. It also requires `getfacl` and `setfacl`; v0.5 does not use a chmod fallback for physical-device isolation.
 
 The script creates:
 
@@ -109,9 +111,9 @@ ds4-probe-results-<timestamp>.tar.gz
 
 Send that archive back after the test.
 
-The guided test will stop and create a diagnostic archive instead of asking for a Diablo IV test unless UHID initializes, a uinput event node is created, Bluetooth reports are read and forwarded to both outputs, and the physical Bluetooth DS4 nodes are isolated from the Steam user.
+The guided test will stop and create a diagnostic archive instead of asking for a Diablo IV test unless UHID initializes, a uinput event node is created, Bluetooth reports are read and forwarded to both outputs, the physical Bluetooth DS4 nodes are isolated from the Steam user, and the UHID touchpad idle self-check is clean.
 
-If physical Bluetooth isolation fails, v0.4 stops before Diablo IV and records `v0.4_valid_diablo_test=no` in the archive.
+If physical Bluetooth isolation or the UHID touchpad idle self-check fails, v0.5 stops before Diablo IV and records `v0.5_valid_diablo_test=no` in the archive.
 
 Emergency permission restore:
 
@@ -243,6 +245,7 @@ The probe should print lines like:
 [uinput] READY: fallback gamepad created ...
 [bridge] READY: Bluetooth input stream opened
 [bridge] forwarded ... Bluetooth input reports
+[touchpad] sample=... active_contacts=0 ...
 ```
 
 It will also print matching `/dev/hidraw*` and `/dev/input/event*` devices when they are discoverable through sysfs.
@@ -251,24 +254,26 @@ It will also print matching `/dev/hidraw*` and `/dev/input/event*` devices when 
 
 During the Diablo IV test, record:
 
-- Did Diablo IV recognize a controller with Steam Input disabled?
+- Did Steam detect the controller?
+- In Steam controller tester, is there still a permanent touchpad contact?
+- Does the virtual DS4 event node still oscillate at idle?
+- Did Diablo IV detect a controller with Steam Input disabled?
 - Did Diablo IV show PlayStation glyphs?
-- Did duplicate inputs happen?
-- Was the real Bluetooth controller also seen by the game?
+- Did input work?
 - Did the probe log UHID errors, GET_REPORT/SET_REPORT requests, or output reports?
 
 ## Decision Rule
 
-If Diablo IV detects the v0.4 bridge and shows PlayStation glyphs:
+If Diablo IV detects the v0.5 bridge and shows PlayStation glyphs:
 
-- Treat the v0.4 physical Bluetooth isolation attempt as a successful gate result.
+- Treat the v0.5 touchpad-neutralized physical Bluetooth isolation attempt as a successful gate result.
 - Then add duplicate input suppression.
 - Then add service/autostart.
 
 If Diablo IV does not show PlayStation glyphs:
 
 - Stop.
-- Report that the v0.4 isolated UHID + uinput attempt was insufficient.
+- Report that the v0.5 isolated UHID + uinput attempt was insufficient.
 - Investigate whether Proton/SDL/Diablo is checking deeper sysfs USB topology, SDL mappings, hidraw path, Wine device exposure, or another layer.
 
 Do not claim Diablo IV compatibility until the remote tester confirms the result on the actual target machine.
