@@ -1,64 +1,49 @@
 # Release Package
 
-## Path A: GitHub Actions Artifact Preferred
+## Preferred: GitHub Actions Artifact
 
-Download the latest green GitHub Actions artifact named:
+Download the latest successful GitHub Actions artifact named:
 
 ```text
 ds4-bt-usb-probe-linux-x86_64
 ```
 
-Send that extracted folder to the remote tester. It contains:
+Send the extracted `ds4-bt-usb-probe-linux-x86_64` folder to the remote tester. It contains:
 
 - compiled `ds4-bt-usb-probe` binary
-- `scripts/`, including `scripts/restore_device_permissions.sh`
+- `scripts/`
 - `README.md`
 - `RELEASE_PACKAGE.md`
 - optional KDE launcher `Run DS4 Probe Test.desktop`
 
-Extract the artifact directly on the Bazzite host. Run the test from a normal Bazzite host terminal.
-
-**Do not run this from distrobox/toolbox.** Cargo inside distrobox may build the project, but the probe needs real host device access.
-
-From inside the extracted artifact folder:
+Extract it directly on the Bazzite host, not inside distrobox/toolbox. From a normal Bazzite host terminal, run:
 
 ```bash
 chmod +x scripts/*.sh
 sudo ./scripts/guided_test.sh
 ```
 
-The preferred file to send back is:
+v0.7 uses `full-uhid-only` as the sole guided gameplay target. The guided script captures real USB, raw Bluetooth, and exact emitted virtual USB reports, then generates a comparison before the Steam/Diablo gate.
+
+The preferred and required file to send back is:
 
 ```text
 ds4-probe-results-<timestamp>.tar.gz
 ```
 
-Version 0.6.0 is a final convergence attempt. It tries:
+That archive contains `truth/report_diff.md`, `truth/summary.json`, the framed report captures, bridge status/logs, tester answers, and permission restore diagnostics.
 
-1. `full-uhid-only`
-2. `full-uhid-plus-uinput-hidden`
-3. `uinput-only`
-4. `identity-only-uhid-plus-uinput`
+**v0.7 capture pass implemented; translator correction requires Sonny's truth archive.**
 
-The primary target is `full-uhid-only`: a single UHID Sony DS4 with translated input and no uinput device. Identity-only UHID plus uinput is diagnostic only and is not the default final behavior. Diablo IV compatibility remains unconfirmed until the tester reports the result.
-
-Emergency permission restore:
+Emergency ACL restore:
 
 ```bash
 sudo ./scripts/restore_device_permissions.sh
 ```
 
-The tester may also try the optional KDE/Bazzite desktop launcher:
+## Fallback: Build From Source
 
-```text
-Run DS4 Probe Test.desktop
-```
-
-If the desktop launcher does not work, run `sudo ./scripts/guided_test.sh` from a terminal.
-
-## Path B: Build From Source Fallback
-
-If the GitHub Actions artifact is not available, send this project folder to the remote tester with these files included. Build and run it on the Bazzite host, not inside distrobox/toolbox:
+If the Actions artifact is unavailable, send these source files:
 
 - `Cargo.toml`
 - `src/`
@@ -69,18 +54,22 @@ If the GitHub Actions artifact is not available, send this project folder to the
 - `.github/workflows/ci.yml`
 - `captures/.gitkeep`
 
-Do not include:
+Do not include `target/`, previous real captures unless intentionally sharing them, or unrelated local files.
 
-- `target/`
-- old real capture folders unless you intentionally want to share them
-- unrelated local files
-
-Example package command from the project root:
+Example source package:
 
 ```bash
 tar --exclude='./target' --exclude='./.git' \
-  -czf ds4-bt-usb-probe.tar.gz \
+  -czf ds4-bt-usb-probe-source.tar.gz \
   Cargo.toml src scripts README.md RELEASE_PACKAGE.md "Run DS4 Probe Test.desktop" .github captures/.gitkeep
 ```
 
-The remote tester should unpack the source package on the Linux target machine, run `chmod +x scripts/*.sh`, build with `./scripts/build_release.sh`, then run `sudo ./scripts/guided_test.sh`.
+Build and run on the Bazzite host:
+
+```bash
+chmod +x scripts/*.sh
+./scripts/build_release.sh
+sudo ./scripts/guided_test.sh
+```
+
+Diablo IV compatibility remains unconfirmed.

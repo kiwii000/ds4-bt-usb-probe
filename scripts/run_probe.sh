@@ -172,6 +172,15 @@ if [ "$MODE" != "probe" ]; then
   fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"
   bridge_args=(bridge "${args[@]}" --raw-capture-dir "$raw_capture_dir" --output-mode "$MODE")
+  if [ -n "${DS4_TRUTH_CAPTURE_ROOT:-}" ] || [ -n "${DS4_TRUTH_ACTION_FILE:-}" ]; then
+    if [ -z "${DS4_TRUTH_CAPTURE_ROOT:-}" ] || [ -z "${DS4_TRUTH_ACTION_FILE:-}" ]; then
+      echo "[run_probe] ERROR: DS4_TRUTH_CAPTURE_ROOT and DS4_TRUTH_ACTION_FILE must be set together"
+      exit 1
+    fi
+    echo "[run_probe] truth capture root: $DS4_TRUTH_CAPTURE_ROOT"
+    echo "[run_probe] truth action file: $DS4_TRUTH_ACTION_FILE"
+    bridge_args+=(--truth-capture-root "$DS4_TRUTH_CAPTURE_ROOT" --truth-action-file "$DS4_TRUTH_ACTION_FILE")
+  fi
   exec "$BIN" "${bridge_args[@]}"
 fi
 exec "$BIN" "${args[@]}"

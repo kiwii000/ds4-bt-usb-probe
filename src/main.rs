@@ -102,11 +102,20 @@ mod linux {
     enum Command {
         Run(Config),
         CaptureFeatures { hidraw: PathBuf, output_dir: PathBuf },
+        CaptureInput {
+            hidraw: PathBuf,
+            action: String,
+            output: PathBuf,
+            duration_ms: u64,
+            report_id: u8,
+            report_size: usize,
+        },
         CaptureIdleInput {
             hidraw: PathBuf,
             output_dir: PathBuf,
             duration_ms: u64,
         },
+        CompareTruth { truth_root: PathBuf },
         MonitorTouchpadEvents {
             event: PathBuf,
             output_dir: PathBuf,
@@ -132,6 +141,8 @@ mod linux {
         output_mode: OutputMode,
         feature_root: Option<PathBuf>,
         raw_capture_dir: Option<PathBuf>,
+        truth_capture_root: Option<PathBuf>,
+        truth_action_file: Option<PathBuf>,
         status_file: Option<PathBuf>,
         uinput_version: Option<u32>,
         idle_template: Option<PathBuf>,
@@ -301,6 +312,19 @@ mod linux {
         gamepad: GamepadState,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CaptureRecord {
+        unix_ms: u64,
+        sequence: u64,
+        payload: Vec<u8>,
+    }
+
+    struct TruthRecorder {
+        root: PathBuf,
+        action_file: PathBuf,
+        sequence: u64,
+    }
+
     pub fn run() -> Result<(), AnyError> {
         let Some(command) = parse_command(env::args().skip(1))? else {
             print_help();
@@ -310,6 +334,21 @@ mod linux {
             Command::CaptureFeatures { hidraw, output_dir } => {
                 capture_features(&hidraw, &output_dir)
             }
+            Command::CaptureInput {
+                hidraw,
+                action,
+                output,
+                duration_ms,
+                report_id,
+                report_size,
+            } => capture_input(
+                &hidraw,
+                &action,
+                &output,
+                duration_ms,
+                report_id,
+                report_size,
+            ),
             Command::CaptureIdleInput {
                 hidraw,
                 output_dir,
@@ -325,6 +364,7 @@ mod linux {
                 output_dir,
                 duration_ms,
             } => monitor_input_events(&event, &output_dir, duration_ms),
+            Command::CompareTruth { truth_root } => compare_truth(&truth_root),
             Command::Run(config) => run_device(config),
         }
     }
@@ -346,7 +386,7 @@ mod linux {
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
         let touchpad_template = load_touchpad_template(&config);
-        status.set("probe_version", "0.6.0");
+        status.set("probe_version", "0.7.0");
         status.set("output_mode", config.output_mode.as_str());
         status.set("touchpad_mode", config.touchpad_mode.as_str());
         status.set("touchpad_template_source", &touchpad_template.source);
@@ -369,6 +409,15 @@ mod linux {
         status.set("touchpad_idle_clean", "true");
         status.set("touchpad_idle_samples_checked", "0");
         status.set("touchpad_active_contacts_emitted", "0");
+        status.set("usb_idle_template_full_base", "true");
+        status.set("keepalive_strategy", "last_translated_report");
+        status.set("translator_corrected_from_truth", "no");
+        status.set("translator_correction_requires_sonny_archive", "yes");
+        status.set(
+            "truth_capture_enabled",
+            config.truth_capture_root.is_some().to_string(),
+        );
+        status.set("truth_pairs_recorded", "0");
         status.set("get_report_eio", "0");
         status.set("running", "true");
         status.set("uhid_version", format!("0x{uhid_version:04x}"));
@@ -601,8 +650,32 @@ mod linux {
         let mut buffer = [0_u8; 256];
         let mut unexpected_count = 0_u32;
         let mut last_keepalive = Instant::now();
+        let mut last_uhid_report = keepalive_report(None, neutral);
         let mut forwarded = 0_u64;
         let mut reconnect_attempted = false;
+        let mut truth_recorder = match (&config.truth_capture_root, &config.truth_action_file) {
+            (Some(root), Some(action_file)) => {
+                println!(
+                    "[truth] paired BT/virtual recording enabled: root={} action_file={}",
+                    root.display(),
+                    action_file.display()
+                );
+                fs::create_dir_all(root.join("bt"))?;
+                fs::create_dir_all(root.join("virtual"))?;
+                Some(TruthRecorder {
+                    root: root.clone(),
+                    action_file: action_file.clone(),
+                    sequence: 0,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(io::Error::other(
+                    "--truth-capture-root and --truth-action-file must be provided together",
+                )
+                .into())
+            }
+        };
         let mut pollfd = libc::pollfd {
             fd: input.as_raw_fd(),
             events: libc::POLLIN,
@@ -667,11 +740,13 @@ mod linux {
             }
             if poll_result == 0 || pollfd.revents & libc::POLLIN == 0 {
                 if last_keepalive.elapsed() >= Duration::from_millis(config.interval_ms.max(4)) {
-                    if let (Some(device), Some(neutral)) =
-                        (device.as_deref_mut(), neutral.as_ref())
-                    {
-                        send_checked_uhid_report(device, neutral, status, "bridge-keepalive")?;
-                        status.increment("uhid_reports_emitted", 1);
+                    if !config.uhid_identity_only {
+                        if let (Some(device), Some(report)) =
+                            (device.as_deref_mut(), last_uhid_report.as_ref())
+                        {
+                            send_checked_uhid_report(device, report, status, "bridge-keepalive-last")?;
+                            status.increment("uhid_reports_emitted", 1);
+                        }
                     }
                     last_keepalive = Instant::now();
                 }
@@ -683,15 +758,19 @@ mod linux {
                     status.increment("bluetooth_reports_read", 1);
                     match translate_bluetooth_report(&buffer[..size], &touchpad_template) {
                         Ok(translated) => {
+                            let mut emitted_virtual = false;
                             if !config.uhid_identity_only {
-                                if let Some(device) = device.as_deref_mut() {
-                                send_checked_uhid_report(
-                                    device,
-                                    &translated.usb_report,
-                                    status,
-                                    "bridge-translated",
-                                )?;
-                                status.increment("uhid_reports_emitted", 1);
+                                if let Some(device) = device.as_deref_mut()
+                                {
+                                    send_checked_uhid_report(
+                                        device,
+                                        &translated.usb_report,
+                                        status,
+                                        "bridge-translated",
+                                    )?;
+                                    last_uhid_report = Some(translated.usb_report);
+                                    emitted_virtual = true;
+                                    status.increment("uhid_reports_emitted", 1);
                                 }
                             }
                             if let Some(output) = uinput.as_mut() {
@@ -704,6 +783,13 @@ mod linux {
                                         err
                                     })?;
                                 status.increment("uinput_events_emitted", emitted);
+                            }
+                            if emitted_virtual {
+                                if let Some(recorder) = truth_recorder.as_mut() {
+                                    if recorder.record_pair(&buffer[..size], &translated.usb_report)? {
+                                        status.increment("truth_pairs_recorded", 1);
+                                    }
+                                }
                             }
                             forwarded += 1;
                             status.increment("bluetooth_reports_forwarded", 1);
@@ -733,6 +819,13 @@ mod linux {
             device.destroy()?;
         }
         Ok(())
+    }
+
+    fn keepalive_report(
+        last_translated: Option<[u8; 64]>,
+        neutral: Option<[u8; 64]>,
+    ) -> Option<[u8; 64]> {
+        last_translated.or(neutral)
     }
 
     fn wait_for_virtual_device(
@@ -1409,6 +1502,67 @@ mod linux {
         Ok(())
     }
 
+    fn capture_input(
+        hidraw: &Path,
+        action: &str,
+        output: &Path,
+        duration_ms: u64,
+        report_id: u8,
+        report_size: usize,
+    ) -> Result<(), AnyError> {
+        let action = validate_action_slug(action)?;
+        if report_size == 0 || report_size > 4096 {
+            return Err(io::Error::other("--report-size must be between 1 and 4096").into());
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        remove_capture_files(output)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(hidraw)?;
+        println!(
+            "[capture-input] action={action} hidraw={} duration_ms={duration_ms} expected_id=0x{report_id:02x} expected_size={report_size}",
+            hidraw.display()
+        );
+        let deadline = Instant::now() + Duration::from_millis(duration_ms.max(100));
+        let mut buffer = vec![0_u8; report_size.max(256)];
+        let mut accepted = 0_u64;
+        let mut rejected = 0_u64;
+        while Instant::now() < deadline {
+            match file.read(&mut buffer) {
+                Ok(0) => thread::sleep(Duration::from_millis(2)),
+                Ok(size) if size == report_size && buffer[0] == report_id => {
+                    let record = CaptureRecord {
+                        unix_ms: unix_ms(),
+                        sequence: accepted,
+                        payload: buffer[..size].to_vec(),
+                    };
+                    append_capture_record(output, &record)?;
+                    accepted += 1;
+                }
+                Ok(_) => rejected += 1,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        println!(
+            "[capture-input] action={action} accepted={accepted} rejected={rejected} output={}",
+            output.display()
+        );
+        if accepted == 0 {
+            return Err(io::Error::other(format!(
+                "no matching reports captured for action {action}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     fn monitor_touchpad_events(
         event: &Path,
         output_dir: &Path,
@@ -1660,6 +1814,63 @@ mod linux {
                 duration_ms,
             }));
         }
+        if args.peek().is_some_and(|arg| arg == "capture-input") {
+            let _ = args.next();
+            let mut hidraw = None;
+            let mut action = None;
+            let mut output = None;
+            let mut duration_ms = 4000;
+            let mut report_id = 0x01;
+            let mut report_size = 64;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--hidraw" => hidraw = Some(PathBuf::from(next_value(&mut args, "--hidraw")?)),
+                    "--action" => action = Some(next_value(&mut args, "--action")?),
+                    "--output" => output = Some(PathBuf::from(next_value(&mut args, "--output")?)),
+                    "--duration-ms" => duration_ms = next_value(&mut args, &arg)?.parse()?,
+                    "--report-id" => {
+                        report_id = u8::try_from(parse_hex_or_dec(&next_value(&mut args, &arg)?)?)
+                            .map_err(|_| io::Error::other("--report-id must fit in one byte"))?
+                    }
+                    "--report-size" => report_size = next_value(&mut args, &arg)?.parse()?,
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "unknown capture-input argument {arg}"
+                        ))
+                        .into())
+                    }
+                }
+            }
+            return Ok(Some(Command::CaptureInput {
+                hidraw: hidraw.ok_or_else(|| io::Error::other("--hidraw is required"))?,
+                action: action.ok_or_else(|| io::Error::other("--action is required"))?,
+                output: output.ok_or_else(|| io::Error::other("--output is required"))?,
+                duration_ms,
+                report_id,
+                report_size,
+            }));
+        }
+        if args.peek().is_some_and(|arg| arg == "compare-truth") {
+            let _ = args.next();
+            let mut truth_root = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--truth-root" => {
+                        truth_root = Some(PathBuf::from(next_value(&mut args, "--truth-root")?))
+                    }
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "unknown compare-truth argument {arg}"
+                        ))
+                        .into())
+                    }
+                }
+            }
+            return Ok(Some(Command::CompareTruth {
+                truth_root: truth_root
+                    .ok_or_else(|| io::Error::other("--truth-root is required"))?,
+            }));
+        }
         if args.peek().is_some_and(|arg| arg == "monitor-touchpad-events") {
             let _ = args.next();
             let mut event = None;
@@ -1722,6 +1933,8 @@ mod linux {
             },
             feature_root: None,
             raw_capture_dir: None,
+            truth_capture_root: None,
+            truth_action_file: None,
             status_file: None,
             uinput_version: None,
             idle_template: None,
@@ -1743,6 +1956,12 @@ mod linux {
                 "--feature-root" => config.feature_root = Some(PathBuf::from(next_value(&mut args, &arg)?)),
                 "--raw-capture-dir" => {
                     config.raw_capture_dir = Some(PathBuf::from(next_value(&mut args, &arg)?))
+                }
+                "--truth-capture-root" => {
+                    config.truth_capture_root = Some(PathBuf::from(next_value(&mut args, &arg)?))
+                }
+                "--truth-action-file" => {
+                    config.truth_action_file = Some(PathBuf::from(next_value(&mut args, &arg)?))
                 }
                 "--status-file" => {
                     config.status_file = Some(PathBuf::from(next_value(&mut args, &arg)?))
@@ -1965,6 +2184,418 @@ mod linux {
         )
     }
 
+    impl TruthRecorder {
+        fn record_pair(&mut self, bluetooth: &[u8], virtual_usb: &[u8; 64]) -> io::Result<bool> {
+            let Some(action) = read_trimmed(&self.action_file) else {
+                return Ok(false);
+            };
+            let action = validate_action_slug_io(&action)?;
+            let timestamp = unix_ms();
+            let sequence = self.sequence;
+            self.sequence += 1;
+            append_capture_record(
+                &self.root.join("bt").join(&action),
+                &CaptureRecord {
+                    unix_ms: timestamp,
+                    sequence,
+                    payload: bluetooth.to_vec(),
+                },
+            )?;
+            append_capture_record(
+                &self.root.join("virtual").join(&action),
+                &CaptureRecord {
+                    unix_ms: timestamp,
+                    sequence,
+                    payload: virtual_usb.to_vec(),
+                },
+            )?;
+            Ok(true)
+        }
+    }
+
+    fn unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn validate_action_slug(action: &str) -> Result<String, AnyError> {
+        Ok(validate_action_slug_io(action)?)
+    }
+
+    fn validate_action_slug_io(action: &str) -> io::Result<String> {
+        let action = action.trim();
+        if action.is_empty()
+            || !action
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
+        {
+            return Err(io::Error::other(
+                "action slug must contain only lowercase ASCII letters, digits, '_' or '-'",
+            ));
+        }
+        Ok(action.to_string())
+    }
+
+    fn capture_bin_path(base: &Path) -> PathBuf {
+        base.with_extension("bin")
+    }
+
+    fn capture_text_path(base: &Path) -> PathBuf {
+        base.with_extension("txt")
+    }
+
+    fn remove_capture_files(base: &Path) -> io::Result<()> {
+        for path in [capture_bin_path(base), capture_text_path(base)] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn append_capture_record(base: &Path, record: &CaptureRecord) -> io::Result<()> {
+        if let Some(parent) = base.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut binary = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(capture_bin_path(base))?;
+        binary.write_all(&record.unix_ms.to_le_bytes())?;
+        binary.write_all(&record.sequence.to_le_bytes())?;
+        let length = u16::try_from(record.payload.len())
+            .map_err(|_| io::Error::other("capture payload is too large"))?;
+        binary.write_all(&length.to_le_bytes())?;
+        binary.write_all(&record.payload)?;
+        let mut text = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(capture_text_path(base))?;
+        writeln!(
+            text,
+            "{}\t{}\t{}\t{}",
+            record.unix_ms,
+            record.sequence,
+            record.payload.len(),
+            hex_all(&record.payload)
+        )
+    }
+
+    fn read_capture_records(base: &Path) -> io::Result<Vec<CaptureRecord>> {
+        let bytes = fs::read(capture_bin_path(base))?;
+        let mut offset = 0;
+        let mut records = Vec::new();
+        while offset < bytes.len() {
+            if bytes.len().saturating_sub(offset) < 18 {
+                return Err(io::Error::other(format!(
+                    "truncated framed capture at byte {offset}"
+                )));
+            }
+            let unix_ms = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            let sequence =
+                u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+            let length = u16::from_le_bytes(bytes[offset + 16..offset + 18].try_into().unwrap())
+                as usize;
+            offset += 18;
+            if bytes.len().saturating_sub(offset) < length {
+                return Err(io::Error::other(format!(
+                    "truncated framed capture payload at byte {offset}"
+                )));
+            }
+            records.push(CaptureRecord {
+                unix_ms,
+                sequence,
+                payload: bytes[offset..offset + length].to_vec(),
+            });
+            offset += length;
+        }
+        Ok(records)
+    }
+
+    fn compare_truth(truth_root: &Path) -> Result<(), AnyError> {
+        let usb_root = truth_root.join("usb");
+        let virtual_root = truth_root.join("virtual");
+        let bt_root = truth_root.join("bt");
+        let idle_usb = read_capture_records(&usb_root.join("idle")).unwrap_or_default();
+        let idle_virtual = read_capture_records(&virtual_root.join("idle")).unwrap_or_default();
+        let idle_usb_dominant = dominant_report(&idle_usb, 64);
+        let idle_virtual_dominant = dominant_report(&idle_virtual, 64);
+        let mut actions = fs::read_dir(&usb_root)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("bin"))
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_string())
+            })
+            .collect::<Vec<_>>();
+        actions.sort();
+        actions.dedup();
+
+        let mut markdown = String::from(
+            "# DS4 truth comparison\n\n\
+             This report compares captured real USB reports with the exact translated virtual USB reports emitted by v0.7. It does not auto-apply mappings.\n\n",
+        );
+        let mut json_actions = Vec::new();
+        let mut complete_actions = 0_usize;
+        for action in &actions {
+            let usb = read_capture_records(&usb_root.join(action)).unwrap_or_default();
+            let bt = read_capture_records(&bt_root.join(action)).unwrap_or_default();
+            let virtual_usb = read_capture_records(&virtual_root.join(action)).unwrap_or_default();
+            let usb_dominant = dominant_report(&usb, 64);
+            let virtual_dominant = dominant_report(&virtual_usb, 64);
+            let usb_changed = changed_bytes(idle_usb_dominant.as_ref(), usb_dominant.as_ref());
+            let virtual_changed =
+                changed_bytes(idle_virtual_dominant.as_ref(), virtual_dominant.as_ref());
+            let missing_changes = set_difference(&usb_changed, &virtual_changed);
+            let unexpected_changes = set_difference(&virtual_changed, &usb_changed);
+            let value_mismatches = mismatched_bytes(usb_dominant.as_ref(), virtual_dominant.as_ref());
+            let usb_variance = varying_bytes(&usb, 64);
+            let virtual_variance = varying_bytes(&virtual_usb, 64);
+            let paired_sequences_match = paired_capture_sequences_match(&bt, &virtual_usb);
+            let complete = usb.len() >= 5
+                && bt.len() >= 5
+                && virtual_usb.len() >= 5
+                && paired_sequences_match;
+            if complete {
+                complete_actions += 1;
+            }
+            markdown.push_str(&format!(
+                "## `{action}`\n\n- complete: `{complete}`\n- samples: USB={} BT={} virtual={}\n- paired BT/virtual sequences match: `{paired_sequences_match}`\n- dominant real USB report: `{}`\n- dominant virtual USB report: `{}`\n- real USB changed bytes: {}\n- virtual changed bytes: {}\n- missing virtual changes: {}\n- unexpected virtual changes: {}\n- dominant value mismatches: {}\n- USB variance bytes: {}\n- virtual variance bytes: {}\n- categories touched: {}\n\n",
+                usb.len(),
+                bt.len(),
+                virtual_usb.len(),
+                dominant_hex(usb_dominant.as_ref()),
+                dominant_hex(virtual_dominant.as_ref()),
+                format_bytes(&usb_changed),
+                format_bytes(&virtual_changed),
+                format_bytes(&missing_changes),
+                format_bytes(&unexpected_changes),
+                format_bytes(&value_mismatches),
+                format_bytes(&usb_variance),
+                format_bytes(&virtual_variance),
+                categories_for_bytes(&usb_changed, &virtual_changed),
+            ));
+            json_actions.push(format!(
+                "{{\"action\":\"{}\",\"complete\":{},\"usb_samples\":{},\"bt_samples\":{},\"virtual_samples\":{},\"paired_sequences_match\":{},\"dominant_usb\":{},\"dominant_virtual\":{},\"usb_changed_bytes\":{},\"virtual_changed_bytes\":{},\"missing_changes\":{},\"unexpected_changes\":{},\"value_mismatches\":{},\"usb_variance_bytes\":{},\"virtual_variance_bytes\":{},\"categories\":{}}}",
+                json_escape(action),
+                complete,
+                usb.len(),
+                bt.len(),
+                virtual_usb.len(),
+                paired_sequences_match,
+                json_optional_u8_array(usb_dominant.as_ref()),
+                json_optional_u8_array(virtual_dominant.as_ref()),
+                json_usize_array(&usb_changed),
+                json_usize_array(&virtual_changed),
+                json_usize_array(&missing_changes),
+                json_usize_array(&unexpected_changes),
+                json_usize_array(&value_mismatches),
+                json_usize_array(&usb_variance),
+                json_usize_array(&virtual_variance),
+                json_string_array(&categories_vec(&usb_changed, &virtual_changed)),
+            ));
+        }
+        fs::create_dir_all(truth_root)?;
+        fs::write(truth_root.join("report_diff.md"), markdown)?;
+        fs::write(
+            truth_root.join("summary.json"),
+            format!(
+                "{{\n  \"format_version\": 1,\n  \"translator_corrected_from_truth\": false,\n  \"translator_correction_requires_sonny_archive\": true,\n  \"actions_seen\": {},\n  \"complete_actions\": {},\n  \"actions\": [\n    {}\n  ]\n}}\n",
+                actions.len(),
+                complete_actions,
+                json_actions.join(",\n    ")
+            ),
+        )?;
+        println!(
+            "[truth] comparison generated: actions={} complete={} report={} summary={}",
+            actions.len(),
+            complete_actions,
+            truth_root.join("report_diff.md").display(),
+            truth_root.join("summary.json").display()
+        );
+        Ok(())
+    }
+
+    fn dominant_report(records: &[CaptureRecord], size: usize) -> Option<Vec<u8>> {
+        let valid = records
+            .iter()
+            .filter(|record| record.payload.len() == size)
+            .collect::<Vec<_>>();
+        if valid.is_empty() {
+            return None;
+        }
+        Some(
+            (0..size)
+                .map(|offset| {
+                    let mut counts = [0_u32; 256];
+                    for record in &valid {
+                        counts[record.payload[offset] as usize] += 1;
+                    }
+                    counts
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, count)| **count)
+                        .map(|(value, _)| value as u8)
+                        .unwrap_or(0)
+                })
+                .collect(),
+        )
+    }
+
+    fn changed_bytes(idle: Option<&Vec<u8>>, action: Option<&Vec<u8>>) -> Vec<usize> {
+        let (Some(idle), Some(action)) = (idle, action) else {
+            return Vec::new();
+        };
+        idle.iter()
+            .zip(action)
+            .enumerate()
+            .filter_map(|(offset, (before, after))| (before != after).then_some(offset))
+            .collect()
+    }
+
+    fn mismatched_bytes(left: Option<&Vec<u8>>, right: Option<&Vec<u8>>) -> Vec<usize> {
+        let (Some(left), Some(right)) = (left, right) else {
+            return Vec::new();
+        };
+        left.iter()
+            .zip(right)
+            .enumerate()
+            .filter_map(|(offset, (left, right))| (left != right).then_some(offset))
+            .collect()
+    }
+
+    fn varying_bytes(records: &[CaptureRecord], size: usize) -> Vec<usize> {
+        (0..size)
+            .filter(|offset| {
+                let mut first = None;
+                records
+                    .iter()
+                    .filter(|record| record.payload.len() == size)
+                    .any(|record| match first {
+                        None => {
+                            first = Some(record.payload[*offset]);
+                            false
+                        }
+                        Some(value) => value != record.payload[*offset],
+                    })
+            })
+            .collect()
+    }
+
+    fn set_difference(left: &[usize], right: &[usize]) -> Vec<usize> {
+        left.iter()
+            .copied()
+            .filter(|value| !right.contains(value))
+            .collect()
+    }
+
+    fn paired_capture_sequences_match(left: &[CaptureRecord], right: &[CaptureRecord]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| {
+                left.sequence == right.sequence && left.unix_ms == right.unix_ms
+            })
+    }
+
+    fn report_region(offset: usize) -> &'static str {
+        match offset {
+            0 => "report-id",
+            1..=4 => "sticks",
+            5..=7 => "buttons-dpad",
+            8..=9 => "triggers",
+            10..=32 => "status-battery-gyro",
+            33..=63 => "touchpad",
+            _ => "outside-usb-report",
+        }
+    }
+
+    fn categories_for_bytes(left: &[usize], right: &[usize]) -> String {
+        let categories = categories_vec(left, right);
+        if categories.is_empty() {
+            "none".to_string()
+        } else {
+            categories.join(", ")
+        }
+    }
+
+    fn categories_vec(left: &[usize], right: &[usize]) -> Vec<&'static str> {
+        let mut categories = left
+            .iter()
+            .chain(right)
+            .map(|offset| report_region(*offset))
+            .collect::<Vec<_>>();
+        categories.sort();
+        categories.dedup();
+        categories
+    }
+
+    fn format_bytes(bytes: &[usize]) -> String {
+        if bytes.is_empty() {
+            "none".to_string()
+        } else {
+            bytes
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+
+    fn json_usize_array(values: &[usize]) -> String {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn json_optional_u8_array(values: Option<&Vec<u8>>) -> String {
+        values.map_or_else(
+            || "null".to_string(),
+            |values| {
+                format!(
+                    "[{}]",
+                    values
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+        )
+    }
+
+    fn json_string_array(values: &[&str]) -> String {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| format!("\"{}\"", json_escape(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn dominant_hex(report: Option<&Vec<u8>>) -> String {
+        report.map_or_else(|| "unavailable".to_string(), |report| hex_all(report))
+    }
+
+    fn json_escape(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+
     fn discover_bluetooth_hidraw(vid: u32, pid: u32) -> Option<PathBuf> {
         discover_hidraw_by_id(0x0005, vid, pid, false).into_iter().next()
     }
@@ -2138,10 +2769,11 @@ mod linux {
     const DS4_USB_TOUCHPAD_BLOCK_END: usize = 64;
 
     fn neutral_usb_ds4_report(touchpad_template: &TouchpadTemplate) -> [u8; 64] {
-        let mut report = [0_u8; 64];
+        let mut report = touchpad_template.report;
         report[DS4_USB_REPORT_ID_OFFSET] = 0x01;
         report[1..5].fill(0x80);
         report[5] = 0x08;
+        report[6..10].fill(0);
         hard_disable_usb_ds4_touchpad(&mut report, touchpad_template);
         report
     }
@@ -2497,13 +3129,15 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.6.0
+            "ds4-bt-usb-probe 0.7.0
 
 Commands:
   ds4-bt-usb-probe [options]
   ds4-bt-usb-probe bridge --output-mode <both|uhid|uinput> --status-file <path>
   ds4-bt-usb-probe capture-features --hidraw <path> --output-dir <dir>
   ds4-bt-usb-probe capture-idle-input --hidraw <path> --output-dir <dir> [--duration-ms <n>]
+  ds4-bt-usb-probe capture-input --hidraw <path> --action <slug> --output <base-path> [--duration-ms <n>] [--report-id <hex>] [--report-size <n>]
+  ds4-bt-usb-probe compare-truth --truth-root <dir>
   ds4-bt-usb-probe monitor-touchpad-events --event <path> --output-dir <dir> [--duration-ms <n>]
   ds4-bt-usb-probe monitor-input-events --event <path> --output-dir <dir> [--duration-ms <n>]
 "
@@ -2519,6 +3153,16 @@ Commands:
                 report: fallback_touchpad_template_report(),
                 source: "test".to_string(),
             }
+        }
+
+        fn test_temp_dir(label: &str) -> PathBuf {
+            let path = env::temp_dir().join(format!(
+                "ds4-bt-usb-probe-{label}-{}-{}",
+                std::process::id(),
+                unix_ms()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            path
         }
 
         #[test]
@@ -2666,6 +3310,172 @@ Commands:
         }
 
         #[test]
+        fn captured_usb_idle_template_is_full_output_base() {
+            let mut template_report = fallback_touchpad_template_report();
+            template_report[10] = 0x44;
+            template_report[20] = 0x55;
+            template_report[32] = 0x66;
+            let template = TouchpadTemplate {
+                report: template_report,
+                source: "truth".to_string(),
+            };
+            let mut bt = [0_u8; 78];
+            bt[0] = 0x11;
+            bt[3..12].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            let translated = translate_bluetooth_report(&bt, &template).unwrap();
+            assert_eq!(translated.usb_report[10], 0x44);
+            assert_eq!(translated.usb_report[20], 0x55);
+            assert_eq!(translated.usb_report[32], 0x66);
+        }
+
+        #[test]
+        fn keepalive_prefers_last_translated_report() {
+            let neutral = [0_u8; 64];
+            let mut translated = [0_u8; 64];
+            translated[1] = 0xff;
+            assert_eq!(keepalive_report(Some(translated), Some(neutral)), Some(translated));
+            assert_eq!(keepalive_report(None, Some(neutral)), Some(neutral));
+        }
+
+        #[test]
+        fn framed_capture_round_trips_and_pair_sequence_matches() {
+            let root = test_temp_dir("truth-pair");
+            let action_file = root.join("current-action.txt");
+            fs::write(&action_file, "cross\n").unwrap();
+            let mut recorder = TruthRecorder {
+                root: root.clone(),
+                action_file,
+                sequence: 9,
+            };
+            let bt = [0x11_u8; 78];
+            let virtual_usb = [0x01_u8; 64];
+            assert!(recorder.record_pair(&bt, &virtual_usb).unwrap());
+            let bt_records = read_capture_records(&root.join("bt/cross")).unwrap();
+            let virtual_records = read_capture_records(&root.join("virtual/cross")).unwrap();
+            assert_eq!(bt_records.len(), 1);
+            assert_eq!(virtual_records.len(), 1);
+            assert_eq!(bt_records[0].sequence, virtual_records[0].sequence);
+            assert_eq!(bt_records[0].unix_ms, virtual_records[0].unix_ms);
+            assert_eq!(bt_records[0].payload.as_slice(), &bt);
+            assert_eq!(virtual_records[0].payload.as_slice(), &virtual_usb);
+            assert!(paired_capture_sequences_match(&bt_records, &virtual_records));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn paired_capture_sequence_mismatch_is_detected() {
+            let left = vec![CaptureRecord {
+                unix_ms: 10,
+                sequence: 1,
+                payload: vec![0x11],
+            }];
+            let right = vec![CaptureRecord {
+                unix_ms: 10,
+                sequence: 2,
+                payload: vec![0x01],
+            }];
+            assert!(!paired_capture_sequences_match(&left, &right));
+        }
+
+        #[test]
+        fn capture_input_command_parses_truth_options() {
+            let command = parse_command(
+                [
+                    "capture-input",
+                    "--hidraw",
+                    "/dev/hidraw1",
+                    "--action",
+                    "cross",
+                    "--output",
+                    "/tmp/truth/usb/cross",
+                    "--duration-ms",
+                    "4000",
+                    "--report-id",
+                    "0x01",
+                    "--report-size",
+                    "64",
+                ]
+                .into_iter()
+                .map(|value| value.to_string()),
+            )
+            .unwrap()
+            .unwrap();
+            let Command::CaptureInput {
+                action,
+                duration_ms,
+                report_id,
+                report_size,
+                ..
+            } = command
+            else {
+                panic!("expected capture-input command");
+            };
+            assert_eq!(action, "cross");
+            assert_eq!(duration_ms, 4000);
+            assert_eq!(report_id, 0x01);
+            assert_eq!(report_size, 64);
+        }
+
+        #[test]
+        fn truth_comparison_regions_classify_report_bytes() {
+            assert_eq!(report_region(0), "report-id");
+            assert_eq!(report_region(2), "sticks");
+            assert_eq!(report_region(6), "buttons-dpad");
+            assert_eq!(report_region(9), "triggers");
+            assert_eq!(report_region(20), "status-battery-gyro");
+            assert_eq!(report_region(40), "touchpad");
+        }
+
+        #[test]
+        fn truth_comparison_writes_reports_without_applying_mappings() {
+            let root = test_temp_dir("truth-compare");
+            for (action, control) in [("idle", 0x80_u8), ("cross", 0x20_u8)] {
+                for sequence in 0..5 {
+                    let mut usb = vec![0_u8; 64];
+                    usb[0] = 0x01;
+                    usb[5] = control;
+                    let mut virtual_usb = usb.clone();
+                    virtual_usb[5] = if action == "cross" { 0x08 } else { control };
+                    let timestamp = 100 + sequence;
+                    append_capture_record(
+                        &root.join("usb").join(action),
+                        &CaptureRecord {
+                            unix_ms: timestamp,
+                            sequence,
+                            payload: usb,
+                        },
+                    )
+                    .unwrap();
+                    append_capture_record(
+                        &root.join("bt").join(action),
+                        &CaptureRecord {
+                            unix_ms: timestamp,
+                            sequence,
+                            payload: vec![0x11; 78],
+                        },
+                    )
+                    .unwrap();
+                    append_capture_record(
+                        &root.join("virtual").join(action),
+                        &CaptureRecord {
+                            unix_ms: timestamp,
+                            sequence,
+                            payload: virtual_usb,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            compare_truth(&root).unwrap();
+            let summary = fs::read_to_string(root.join("summary.json")).unwrap();
+            let report = fs::read_to_string(root.join("report_diff.md")).unwrap();
+            assert!(summary.contains("\"translator_corrected_from_truth\": false"));
+            assert!(summary.contains("\"complete_actions\": 2"));
+            assert!(report.contains("missing virtual changes"));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn touchpad_event_classifier_detects_multitouch_events() {
             let mut event = input_event(EV_KEY, BTN_TOUCH, 1);
             assert_eq!(touchpad_event_label(&event), Some("BTN_TOUCH"));
@@ -2718,7 +3528,7 @@ Commands:
         }
 
         #[test]
-        fn output_mode_flags_match_v06_runtime_modes() {
+        fn output_mode_flags_preserve_manual_diagnostic_modes() {
             assert!(OutputMode::UhidOnly.uhid_enabled());
             assert!(!OutputMode::UhidOnly.uinput_enabled());
             assert!(OutputMode::Both.uhid_enabled());
