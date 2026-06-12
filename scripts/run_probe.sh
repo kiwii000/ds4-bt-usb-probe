@@ -13,6 +13,10 @@ case "${1:-}" in
     MODE="uhid"
     shift
     ;;
+  --uinput-only)
+    MODE="uinput"
+    shift
+    ;;
   --probe-only)
     MODE="probe"
     shift
@@ -27,19 +31,19 @@ if [ -e /run/.containerenv ] || [ -e /.dockerenv ] || [ -n "${DISTROBOX_ENTER_PA
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "[run_probe] ERROR: this script must be run with sudo/root so it can open /dev/uhid."
+  echo "[run_probe] ERROR: this script must be run with sudo/root so it can open host controller devices."
   echo "[run_probe] Try: sudo ./scripts/run_probe.sh"
   exit 1
 fi
 
-if [ ! -e /dev/uhid ]; then
+if [ "$MODE" != "uinput" ] && [ ! -e /dev/uhid ]; then
   echo "[run_probe] ERROR: /dev/uhid does not exist."
   echo "[run_probe] Try: sudo modprobe uhid"
   echo "[run_probe] Then rerun: sudo ./scripts/guided_test.sh"
   exit 1
 fi
 
-if [ ! -w /dev/uhid ]; then
+if [ "$MODE" != "uinput" ] && [ ! -w /dev/uhid ]; then
   echo "[run_probe] ERROR: /dev/uhid is not writable by the current effective user."
   echo "[run_probe] Try: sudo modprobe uhid"
   echo "[run_probe] Then rerun: sudo ./scripts/guided_test.sh"
@@ -162,8 +166,8 @@ if [ "$MODE" != "probe" ]; then
     echo "[run_probe] UHID identity-only mode enabled; gameplay input will be emitted through uinput"
     args+=(--uhid-identity-only)
   fi
-  if [ "$MODE" = "both" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
-    echo "[run_probe] WARNING: no uinput device node is visible; the v0.5.2 default Diablo gate will fail"
+  if [ "$MODE" != "uhid" ] && [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ]; then
+    echo "[run_probe] WARNING: no uinput device node is visible; modes that need uinput will fail"
     echo "[run_probe] Try: sudo modprobe uinput"
   fi
   raw_capture_dir="${DS4_RAW_CAPTURE_DIR:-$ROOT_DIR/captures/bridge-raw}"

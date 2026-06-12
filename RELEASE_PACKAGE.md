@@ -18,7 +18,7 @@ Send that extracted folder to the remote tester. It contains:
 
 Extract the artifact directly on the Bazzite host. Run the test from a normal Bazzite host terminal.
 
-**Do not run this from distrobox/toolbox.** Cargo inside distrobox may build the project, but the UHID probe needs the real host `/dev/uhid`.
+**Do not run this from distrobox/toolbox.** Cargo inside distrobox may build the project, but the probe needs real host device access.
 
 From inside the extracted artifact folder:
 
@@ -27,28 +27,26 @@ chmod +x scripts/*.sh
 sudo ./scripts/guided_test.sh
 ```
 
-If `/dev/uhid` is missing or inaccessible:
-
-```bash
-sudo modprobe uhid
-sudo ./scripts/guided_test.sh
-```
-
-The guided script also attempts `modprobe uinput` when the required uinput fallback node is absent. v0.5.2 requires `getfacl` and `setfacl` for ACL-only physical Bluetooth evdev/js isolation; it does not use chmod fallback and does not restrict the active Bluetooth hidraw reader in the default mode. It validates uinput button/stick events before Steam Tester/Diablo and packages failures for diagnosis.
-
-Emergency permission restore:
-
-```bash
-sudo ./scripts/restore_device_permissions.sh
-```
-
 The preferred file to send back is:
 
 ```text
 ds4-probe-results-<timestamp>.tar.gz
 ```
 
-Version 0.5.2 preserves the UHID Sony identity and required uinput evdev fallback, keeps the active Bluetooth hidraw reader stable, and validates the selected input path before Diablo. Identity-only mode permits a missing UHID input event node but requires a passing uinput button/stick event monitor. It is not confirmed compatible with Diablo IV until the remote tester reports the result.
+Version 0.6.0 is a final convergence attempt. It tries:
+
+1. `full-uhid-only`
+2. `full-uhid-plus-uinput-hidden`
+3. `uinput-only`
+4. `identity-only-uhid-plus-uinput`
+
+The primary target is `full-uhid-only`: a single UHID Sony DS4 with translated input and no uinput device. Identity-only UHID plus uinput is diagnostic only and is not the default final behavior. Diablo IV compatibility remains unconfirmed until the tester reports the result.
+
+Emergency permission restore:
+
+```bash
+sudo ./scripts/restore_device_permissions.sh
+```
 
 The tester may also try the optional KDE/Bazzite desktop launcher:
 

@@ -40,31 +40,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if [ ! -e /dev/uhid ]; then
-  echo "[guided] ERROR: /dev/uhid does not exist." >&2
-  echo "[guided] Try: sudo modprobe uhid" >&2
-  echo "[guided] Then rerun: sudo ./scripts/guided_test.sh" >&2
-  exit 1
-fi
-
-if [ ! -w /dev/uhid ]; then
-  echo "[guided] ERROR: /dev/uhid is not writable by the current effective user." >&2
-  echo "[guided] Try: sudo modprobe uhid" >&2
-  echo "[guided] Then rerun: sudo ./scripts/guided_test.sh" >&2
-  exit 1
-fi
-
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CAPTURE_ROOT="$ROOT_DIR/captures"
 RUN_DIR="$CAPTURE_ROOT/$TIMESTAMP/guided"
+MODES_DIR="$RUN_DIR/modes"
 PERM_DIR="$RUN_DIR/device_permissions"
 ARCHIVE="$ROOT_DIR/ds4-probe-results-$TIMESTAMP.tar.gz"
 GUIDED_LOG="$RUN_DIR/guided_test.log"
-PROBE_LOG="$RUN_DIR/probe.log"
-STATUS_FILE="$RUN_DIR/bridge_status.txt"
-MONITOR_DIR="$RUN_DIR/uhid_event_touchpad_monitor"
-UINPUT_MONITOR_DIR="$RUN_DIR/uinput_event_monitor"
 RESULT_SUMMARY="$RUN_DIR/result_summary.txt"
 PROTON_NOTES="$RUN_DIR/proton_visibility_notes.txt"
 MANIFEST="$PERM_DIR/manifest.tsv"
@@ -72,81 +55,138 @@ DISCOVERED_NODES="$PERM_DIR/discovered_physical_bt_nodes.tsv"
 RESTRICTED_NODES="$PERM_DIR/restricted_nodes.tsv"
 ISOLATION_LOG="$PERM_DIR/isolation.log"
 RESTORE_LOG="$PERM_DIR/restore.log"
+
+MODE_ORDER=(
+  full-uhid-only
+  full-uhid-plus-uinput-hidden
+  uinput-only
+  identity-only-uhid-plus-uinput
+)
+
 PROBE_PID=""
+CURRENT_MODE=""
+CURRENT_MODE_DIR=""
+STATUS_FILE=""
+PROBE_LOG=""
 RESTORE_STATUS="not_attempted"
-SELECTED_RUNTIME_MODE="full-uhid-input"
-BRIDGE_STABLE_PRE_DIABLO="no"
+FINAL_CONCLUSION=""
+SELECTED_FINAL_MODE=""
+CLEAN_CONTROLLER_REFUSED="no"
+ANY_STEAM_PASS="no"
+INPUT_ONLY_SUCCESS_MODE=""
 
-mkdir -p "$RUN_DIR" "$PERM_DIR" "$MONITOR_DIR" "$UINPUT_MONITOR_DIR"
+mkdir -p "$RUN_DIR" "$MODES_DIR" "$PERM_DIR"
 exec > >(tee -a "$GUIDED_LOG") 2>&1
-
-TARGET_USER="${DS4_TEST_USER:-${SUDO_USER:-}}"
-if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
-  echo "[guided] ERROR: could not determine the normal Steam user to isolate."
-  echo "[guided] Re-run with sudo from the Steam user's terminal, or set DS4_TEST_USER=<username>."
-  exit 1
-fi
-if ! id "$TARGET_USER" >/dev/null 2>&1; then
-  echo "[guided] ERROR: target user does not exist: $TARGET_USER"
-  exit 1
-fi
-if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
-  echo "[guided] ERROR: v0.5.2 requires getfacl, setfacl, and sudo for ACL-only isolation."
-  echo "[guided] This v0.5.2 Diablo test is not valid yet. Install ACL tools or send this archive/log back."
-  printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
-  printf 'missing getfacl/setfacl/sudo\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
-fi
-
-cat >"$RUN_DIR/expected_virtual_identity.txt" <<'EOF'
-Expected virtual Proton-visible identity:
-HID_ID=0003:0000054C:000009CC
-HID_NAME=Sony Interactive Entertainment Wireless Controller
-bus_type=1
-input_report=0x01, 64-byte USB-style DS4
-
-Expected uinput fallback identity:
-bus=BUS_USB
-vendor=0x054c
-product=0x09cc
-name=Sony Interactive Entertainment Wireless Controller
-
-Physical Bluetooth comparison:
-HID_ID=0005:0000054C:000009CC
-bus_type=2
-input_report=0x11, 78-byte Bluetooth DS4
-EOF
-
-cat >"$PROTON_NOTES" <<'EOF'
-Proton visibility notes
-=======================
-Expected real USB identity:
-  HID_ID=0003:0000054C:000009CC
-  HID_NAME=Sony Interactive Entertainment Wireless Controller
-  bus_type=1
-
-v0.5.2 virtual identities:
-  UHID: BUS_USB / 054c:09cc with the captured USB descriptor and feature replies.
-  uinput: BUS_USB / 054c:09cc evdev gamepad with normal axes and buttons.
-
-v0.5.2 isolation attempt:
-  After the bridge opens the physical Bluetooth hidraw device, stable-default leaves that active hidraw node untouched and uses ACLs only for physical evdev/js nodes.
-  Virtual UHID/uinput nodes are not restricted.
-
-v0.5.2 touchpad and input-path gate:
-  UHID USB DS4 reports intentionally encode no active touchpad contacts and freeze the touchpad block until a correct touchpad conversion is implemented.
-  The UHID virtual event node is externally monitored before Diablo.
-
-Known caveat:
-  UHID still lives under /sys/devices/virtual/misc/uhid, not a real USB parent.
-  The v0.5.2 test allows identity-only UHID without an input event node and requires validated uinput gameplay events before Steam Tester/Diablo.
-EOF
 
 printf 'kind\tnode\tsyspath\tacl_file\tstat_file\n' >"$MANIFEST"
 : >"$DISCOVERED_NODES"
 : >"$RESTRICTED_NODES"
 : >"$ISOLATION_LOG"
 : >"$RESTORE_LOG"
+: >"$RUN_DIR/modes_attempted.txt"
+printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
+printf 'none\n' >"$RUN_DIR/selected_final_mode.txt"
+printf 'inconclusive\n' >"$RUN_DIR/final_conclusion.txt"
+
+TARGET_USER="${DS4_TEST_USER:-${SUDO_USER:-}}"
+
+mode_uhid_enabled() {
+  case "$1" in
+    uinput-only) printf 'no\n' ;;
+    *) printf 'yes\n' ;;
+  esac
+}
+
+mode_uinput_enabled() {
+  case "$1" in
+    full-uhid-only) printf 'no\n' ;;
+    *) printf 'yes\n' ;;
+  esac
+}
+
+mode_identity_only() {
+  case "$1" in
+    identity-only-uhid-plus-uinput) printf 'yes\n' ;;
+    *) printf 'no\n' ;;
+  esac
+}
+
+mode_probe_arg() {
+  case "$1" in
+    full-uhid-only) printf '%s\n' '--uhid-only' ;;
+    full-uhid-plus-uinput-hidden) printf '%s\n' '--bridge' ;;
+    uinput-only) printf '%s\n' '--uinput-only' ;;
+    identity-only-uhid-plus-uinput) printf '%s\n' '--bridge' ;;
+  esac
+}
+
+mode_description() {
+  case "$1" in
+    full-uhid-only)
+      echo "UHID Sony DS4 only: full translated UHID reports, hard-disabled touchpad, no uinput device."
+      ;;
+    full-uhid-plus-uinput-hidden)
+      echo "Experimental fallback: full UHID DS4 plus uinput gameplay fallback. Physical Bluetooth evdev/js is isolated; uinput is not hidden."
+      ;;
+    uinput-only)
+      echo "Diagnostic input-only mode: no UHID DS4 identity; uinput carries gameplay input and PlayStation glyphs are not expected."
+      ;;
+    identity-only-uhid-plus-uinput)
+      echo "Diagnostic comparison mode: UHID identity-only plus uinput gameplay, known to be duplicate-prone from v0.5.2."
+      ;;
+  esac
+}
+
+status_value() {
+  local key="$1"
+  [ -n "$STATUS_FILE" ] || return 0
+  sed -n "s/^${key}=//p" "$STATUS_FILE" 2>/dev/null | tail -n 1
+}
+
+status_number() {
+  local value
+  value="$(status_value "$1")"
+  case "${value:-0}" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
+mode_status_value() {
+  local mode="$1"
+  local key="$2"
+  local file="$MODES_DIR/$mode/bridge_status.txt"
+  sed -n "s/^${key}=//p" "$file" 2>/dev/null | tail -n 1
+}
+
+line_count() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    wc -l <"$file" | tr -d ' '
+  else
+    printf '0\n'
+  fi
+}
+
+kind_count() {
+  local file="$1"
+  local kind="$2"
+  awk -F '\t' -v kind="$kind" '$1 == kind { count++ } END { print count + 0 }' "$file" 2>/dev/null || echo 0
+}
+
+find_probe_binary() {
+  local candidate
+  for candidate in "$ROOT_DIR/ds4-bt-usb-probe" "$ROOT_DIR/target/release/ds4-bt-usb-probe"; do
+    if [ -f "$candidate" ]; then
+      chmod +x "$candidate" 2>/dev/null || true
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
 
 stop_probe() {
   if [ -n "$PROBE_PID" ] && kill -0 "$PROBE_PID" >/dev/null 2>&1; then
@@ -160,6 +200,7 @@ stop_probe() {
     fi
     wait "$PROBE_PID" >/dev/null 2>&1 || true
   fi
+  PROBE_PID=""
 }
 
 restore_permissions() {
@@ -211,68 +252,30 @@ restore_permissions() {
   [ "$failures" -eq 0 ]
 }
 
-finish_archive() {
-  write_result_summary
-  echo "[guided] Creating results archive"
-  (
-    cd "$CAPTURE_ROOT" &&
-      tar -czf "$ARCHIVE" "$TIMESTAMP"
-  )
-  echo
-  echo "Send this file back: $ARCHIVE"
-}
-
-status_value() {
-  local key="$1"
-  sed -n "s/^${key}=//p" "$STATUS_FILE" 2>/dev/null | tail -n 1
-}
-
-status_number() {
-  local value
-  value="$(status_value "$1")"
-  printf '%s\n' "${value:-0}"
-}
-
-find_probe_binary() {
-  local candidate
-  for candidate in "$ROOT_DIR/ds4-bt-usb-probe" "$ROOT_DIR/target/release/ds4-bt-usb-probe"; do
-    if [ -f "$candidate" ]; then
-      chmod +x "$candidate" 2>/dev/null || true
-      if [ -x "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
+copy_summaries() {
+  mkdir -p "$RUN_DIR/summaries"
+  local mode
+  for mode in usb bluetooth; do
+    if [ -f "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt" ]; then
+      cp "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt" "$RUN_DIR/summaries/${mode}_summary.txt" 2>/dev/null || true
     fi
   done
-  return 1
-}
-
-line_count() {
-  local file="$1"
-  if [ -f "$file" ]; then
-    wc -l <"$file" | tr -d ' '
-  else
-    printf '0\n'
-  fi
-}
-
-kind_count() {
-  local file="$1"
-  local kind="$2"
-  awk -F '\t' -v kind="$kind" '$1 == kind { count++ } END { print count + 0 }' "$file" 2>/dev/null || echo 0
 }
 
 write_result_summary() {
+  local mode mode_dir status_file final selected modes_attempted
+  final="$(cat "$RUN_DIR/final_conclusion.txt" 2>/dev/null || echo "${FINAL_CONCLUSION:-inconclusive}")"
+  selected="$(cat "$RUN_DIR/selected_final_mode.txt" 2>/dev/null || echo "${SELECTED_FINAL_MODE:-none}")"
+  modes_attempted="$(paste -sd, "$RUN_DIR/modes_attempted.txt" 2>/dev/null || echo none)"
   {
-    echo "DS4 v0.5.2 guided result summary"
+    echo "DS4 v0.6 guided result summary"
     echo "timestamp=$TIMESTAMP"
     echo "target_user=$TARGET_USER"
     echo "guided_mode=$GUIDED_MODE"
-    echo "valid_diablo_test=$(cat "$RUN_DIR/valid_diablo_test.txt" 2>/dev/null || echo unknown)"
-    echo "v0.5_valid_diablo_test=$(cat "$RUN_DIR/v0.5_valid_diablo_test.txt" 2>/dev/null || echo unknown)"
-    echo "v0.5_invalid_reason=$(cat "$RUN_DIR/v0.5_invalid_reason.txt" 2>/dev/null || echo none)"
-    echo "selected_runtime_mode=$(cat "$RUN_DIR/selected_runtime_mode.txt" 2>/dev/null || echo "$SELECTED_RUNTIME_MODE")"
-    echo "bridge_stable_pre_diablo=$(cat "$RUN_DIR/bridge_stable_pre_diablo.txt" 2>/dev/null || echo no)"
+    echo "modes_attempted=${modes_attempted:-none}"
+    echo "selected_final_mode=${selected:-none}"
+    echo "final_conclusion=${final:-inconclusive}"
+    echo "valid_diablo_test=$(cat "$RUN_DIR/valid_diablo_test.txt" 2>/dev/null || echo no)"
     echo "permission_restore_status=$RESTORE_STATUS"
     echo
     for mode in usb bluetooth; do
@@ -284,87 +287,77 @@ write_result_summary() {
       fi
       echo
     done
-    echo "[virtual bridge status]"
-    if [ -f "$STATUS_FILE" ]; then
-      cat "$STATUS_FILE"
-    else
-      echo "bridge_status=unavailable"
-    fi
-    echo
-    echo "[v0.5.2 touchpad and input-path checks]"
-    echo "touchpad_neutralization_enabled=$(status_value touchpad_neutralization_enabled)"
-    echo "touchpad_no_touch_encoding=$(status_value touchpad_no_touch_encoding)"
-    echo "touchpad_mode=$(status_value touchpad_mode)"
-    echo "uhid_identity_only=$(status_value uhid_identity_only)"
-    echo "internal_touchpad_idle_clean=$(status_value touchpad_idle_clean)"
-    echo "touchpad_idle_samples_checked=$(status_number touchpad_idle_samples_checked)"
-    echo "internal_touchpad_active_contacts_emitted=$(status_number touchpad_active_contacts_emitted)"
-    echo "uhid_event_touchpad_idle_clean=$(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null || echo unknown)"
-    echo "uhid_event_touchpad_events_seen=$(cat "$RUN_DIR/uhid_event_touchpad_events_seen.txt" 2>/dev/null || echo 0)"
-    echo "uhid_event_touchpad_event_samples=$(cat "$RUN_DIR/uhid_event_touchpad_event_samples.txt" 2>/dev/null || echo none)"
-    echo "uhid_event_monitor_status=$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null || echo unknown)"
-    echo "identity_only_missing_uhid_event_node_allowed=$(cat "$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt" 2>/dev/null || echo no)"
-    echo "uinput_event_node=$(status_value uinput_event_node)"
-    echo "uinput_event_monitor_available=$(cat "$RUN_DIR/uinput_event_monitor_available.txt" 2>/dev/null || echo no)"
-    echo "uinput_events_seen=$(cat "$RUN_DIR/uinput_events_seen.txt" 2>/dev/null || echo 0)"
-    echo "uinput_buttons_sticks_validation=$(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null || echo unknown)"
-    echo "selected_input_path=$(cat "$RUN_DIR/selected_input_path.txt" 2>/dev/null || echo unknown)"
-    echo "diablo_test_allowed_reason=$(cat "$RUN_DIR/diablo_test_allowed_reason.txt" 2>/dev/null || echo none)"
-    echo "usb_idle_template_captured=$(cat "$CAPTURE_ROOT/$TIMESTAMP/usb/idle_input/status.txt" 2>/dev/null | sed -n 's/^usb_idle_template_captured=//p' | tail -n 1 || echo unknown)"
-    echo
     echo "[physical Bluetooth isolation]"
-    echo "physical_bt_nodes_found=$(line_count "$DISCOVERED_NODES")"
-    echo "physical_bt_hidraw_nodes_found=$(kind_count "$DISCOVERED_NODES" hidraw)"
-    echo "physical_bt_event_nodes_found=$(kind_count "$DISCOVERED_NODES" event)"
-    echo "physical_bt_js_nodes_found=$(kind_count "$DISCOVERED_NODES" js)"
-    echo "restricted_nodes=$(line_count "$RESTRICTED_NODES")"
-    echo "restricted_hidraw_nodes=$(kind_count "$RESTRICTED_NODES" hidraw)"
-    echo "restricted_event_nodes=$(kind_count "$RESTRICTED_NODES" event)"
-    echo "restricted_js_nodes=$(kind_count "$RESTRICTED_NODES" js)"
-    echo "isolation_success=$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)"
-    echo "active_physical_hidraw=$(status_value bluetooth_hidraw)"
-    echo "active_physical_hidraw_restricted=$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)"
-    echo "evdev_js_nodes_restricted=$(cat "$RUN_DIR/evdev_js_nodes_restricted.txt" 2>/dev/null || echo no)"
-    echo "bluetooth_reports_forwarded=$(status_number bluetooth_reports_forwarded)"
-    echo "uinput_events_emitted=$(status_number uinput_events_emitted)"
-    echo "clean_hidraw_loss=$(status_value clean_hidraw_loss)"
-    echo "bluetooth_reconnect_success=$(status_value bluetooth_reconnect_success)"
-    echo "virtual_uhid_nodes=$(status_value uhid_hidraw_nodes),$(status_value uhid_input_nodes)"
-    echo "virtual_uinput_node=$(status_value uinput_event_node)"
     echo "manifest=$MANIFEST"
-    echo "discovered_nodes=$DISCOVERED_NODES"
-    echo "restricted_nodes_file=$RESTRICTED_NODES"
-    echo "isolation_log=$ISOLATION_LOG"
     echo "restore_log=$RESTORE_LOG"
+    echo "active_physical_hidraw_restricted_final=$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)"
     echo
-    if [ -s "$DISCOVERED_NODES" ]; then
-      echo "[physical BT nodes found]"
-      cat "$DISCOVERED_NODES"
+    for mode in "${MODE_ORDER[@]}"; do
+      mode_dir="$MODES_DIR/$mode"
+      [ -d "$mode_dir" ] || continue
+      status_file="$mode_dir/bridge_status.txt"
+      echo "[mode:$mode]"
+      echo "description=$(mode_description "$mode")"
+      echo "uhid_enabled=$(cat "$mode_dir/uhid_enabled.txt" 2>/dev/null || mode_uhid_enabled "$mode")"
+      echo "uhid_identity_only=$(cat "$mode_dir/uhid_identity_only.txt" 2>/dev/null || mode_identity_only "$mode")"
+      echo "uinput_enabled=$(cat "$mode_dir/uinput_enabled.txt" 2>/dev/null || mode_uinput_enabled "$mode")"
+      echo "physical_bt_evdev_js_isolated=$(cat "$mode_dir/physical_bt_evdev_js_isolated.txt" 2>/dev/null || echo unknown)"
+      echo "active_physical_hidraw_restricted=$(cat "$mode_dir/active_physical_hidraw_restricted.txt" 2>/dev/null || echo unknown)"
+      echo "uhid_ready=$(sed -n 's/^uhid_ready=//p' "$status_file" 2>/dev/null | tail -n 1 || echo unknown)"
+      echo "uinput_ready=$(sed -n 's/^uinput_ready=//p' "$status_file" 2>/dev/null | tail -n 1 || echo unknown)"
+      echo "bluetooth_reports_forwarded=$(sed -n 's/^bluetooth_reports_forwarded=//p' "$status_file" 2>/dev/null | tail -n 1 || echo 0)"
+      echo "uhid_reports_emitted=$(sed -n 's/^uhid_reports_emitted=//p' "$status_file" 2>/dev/null | tail -n 1 || echo 0)"
+      echo "uinput_events_emitted=$(sed -n 's/^uinput_events_emitted=//p' "$status_file" 2>/dev/null | tail -n 1 || echo 0)"
+      echo "steam_controller_count=$(cat "$mode_dir/steam_controller_count.txt" 2>/dev/null || echo unanswered)"
+      echo "steam_controller_entry_tested=$(cat "$mode_dir/steam_controller_entry_tested.txt" 2>/dev/null || echo unanswered)"
+      echo "steam_tester_permanent_touchpad_contact=$(cat "$mode_dir/steam_tester_permanent_touchpad_contact.txt" 2>/dev/null || echo unanswered)"
+      echo "steam_tester_buttons_sticks_worked=$(cat "$mode_dir/steam_tester_buttons_sticks_worked.txt" 2>/dev/null || echo unanswered)"
+      echo "steam_duplicate_controller_confusion=$(cat "$mode_dir/steam_duplicate_controller_confusion.txt" 2>/dev/null || echo unanswered)"
+      echo "steam_gate_passed=$(cat "$mode_dir/steam_gate_passed.txt" 2>/dev/null || echo no)"
+      echo "diablo_controller_detected=$(cat "$mode_dir/diablo_controller_detected.txt" 2>/dev/null || echo unanswered)"
+      echo "diablo_playstation_glyphs=$(cat "$mode_dir/diablo_playstation_glyphs.txt" 2>/dev/null || echo unanswered)"
+      echo "diablo_input_worked=$(cat "$mode_dir/diablo_input_worked.txt" 2>/dev/null || echo unanswered)"
+      echo "diablo_duplicate_input=$(cat "$mode_dir/diablo_duplicate_input.txt" 2>/dev/null || echo unanswered)"
+      echo "mode_conclusion=$(cat "$mode_dir/mode_conclusion.txt" 2>/dev/null || echo unknown)"
       echo
-    fi
-    if [ -s "$RESTRICTED_NODES" ]; then
-      echo "[physical BT nodes restricted]"
-      cat "$RESTRICTED_NODES"
-      echo
-    fi
-    echo "[tester answers and guided results]"
-    for result in "$RUN_DIR"/steam_*.txt "$RUN_DIR"/script_*.txt "$RUN_DIR"/diablo_*.txt "$RUN_DIR"/guided_gate_result.txt; do
-      [ -f "$result" ] || continue
-      printf '%s=' "$(basename "$result" .txt)"
-      cat "$result"
     done
   } >"$RESULT_SUMMARY"
+}
+
+finish_archive() {
+  copy_summaries
+  write_result_summary
+  echo "[guided] Creating results archive"
+  (
+    cd "$CAPTURE_ROOT" &&
+      tar -czf "$ARCHIVE" "$TIMESTAMP"
+  )
+  echo
+  echo "Send this file back: $ARCHIVE"
+}
+
+fatal_archive() {
+  local reason="$1"
+  echo "[guided] ERROR: $reason"
+  printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
+  printf '%s\n' "$reason" >"$RUN_DIR/fatal_error.txt"
+  if [ -z "$FINAL_CONCLUSION" ]; then
+    FINAL_CONCLUSION="inconclusive"
+    printf '%s\n' "$FINAL_CONCLUSION" >"$RUN_DIR/final_conclusion.txt"
+  fi
+  restore_permissions || true
+  stop_probe
+  finish_archive
+  exit 1
 }
 
 cleanup_on_signal() {
   echo
   echo "[guided] Interrupted; restoring permissions and cleaning up."
   printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
-  printf 'interrupted\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
+  printf 'inconclusive\n' >"$RUN_DIR/final_conclusion.txt"
   restore_permissions || true
   stop_probe
-  copy_summaries
   finish_archive
   exit 130
 }
@@ -386,11 +379,35 @@ wait_for_enter_while_probe_alive() {
     if read -r -t 1 ignored; then
       return 0
     fi
-    if [ -z "$PROBE_PID" ] || ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
-      startup_failed "probe or Bluetooth bridge exited during the Diablo IV test"
+    if ! probe_alive_for_mode "$CURRENT_MODE"; then
+      echo
+      echo "[guided] ERROR: probe or Bluetooth bridge exited during $CURRENT_MODE."
+      printf 'probe exited during tester step\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
       return 1
     fi
   done
+}
+
+ask_choice() {
+  local prompt="$1"
+  local output="$2"
+  shift 2
+  local answer=""
+  local allowed=" $* "
+  while true; do
+    echo
+    read -r -p "$prompt ($*): " answer
+    answer="${answer,,}"
+    if [[ "$allowed" == *" $answer "* ]]; then
+      printf '%s\n' "$answer" >"$output"
+      return 0
+    fi
+    echo "Please answer one of: $*"
+  done
+}
+
+ask_yn_unsure() {
+  ask_choice "$1" "$2" yes no unsure
 }
 
 run_capture_step() {
@@ -410,7 +427,7 @@ run_capture_step() {
 
 prepare_uinput() {
   echo
-  echo "[guided] Checking uinput fallback support"
+  echo "[guided] Checking uinput support"
   if [ ! -e /dev/uinput ] && [ ! -e /dev/input/uinput ] && command -v modprobe >/dev/null 2>&1; then
     echo "[guided] uinput node is absent; trying: modprobe uinput"
     modprobe uinput 2>&1 || true
@@ -418,85 +435,8 @@ prepare_uinput() {
   if [ -e /dev/uinput ] || [ -e /dev/input/uinput ]; then
     echo "[guided] uinput device node is available"
   else
-    echo "[guided] WARNING: no uinput device node is visible; bridge startup will archive this failure"
+    echo "[guided] WARNING: no uinput device node is visible; uinput modes will fail"
   fi
-}
-
-start_probe() {
-  local runtime_mode="${1:-full-uhid-input}"
-  local identity_only
-  echo
-  echo "Step 3:"
-  echo "[guided] Starting required UHID + uinput + Bluetooth bridge ($runtime_mode)"
-  SELECTED_RUNTIME_MODE="$runtime_mode"
-  PROBE_LOG="$RUN_DIR/probe-$runtime_mode.log"
-  : >"$STATUS_FILE"
-  if [ "$runtime_mode" = "identity-only-uhid" ]; then
-    identity_only="yes"
-  else
-    identity_only="no"
-  fi
-
-  DS4_UHID_IDENTITY_ONLY="$identity_only" \
-    DS4_TOUCHPAD_MODE="hard-disabled" \
-  DS4_RAW_CAPTURE_DIR="$RUN_DIR/raw_bluetooth_reports" \
-    DS4_STATUS_FILE="$STATUS_FILE" \
-    "$ROOT_DIR/scripts/run_probe.sh" --bridge >"$PROBE_LOG" 2>&1 &
-  PROBE_PID=$!
-
-  echo "$PROBE_PID" >"$RUN_DIR/probe.pid"
-  echo "[guided] Probe PID: $PROBE_PID"
-  echo "[guided] Probe output: $PROBE_LOG"
-  local attempt
-  for attempt in $(seq 1 30); do
-    if [ -n "$(status_value uinput_error)" ] && [ "$(status_value uinput_ready)" != "true" ]; then
-      startup_failed "uinput fallback failed"
-      return 1
-    fi
-    if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
-      startup_failed "probe process exited early"
-      return 1
-    fi
-    local uhid_output_ok
-    if [ "$runtime_mode" = "identity-only-uhid" ] || [ "$(status_number uhid_reports_emitted)" -gt 0 ]; then
-      uhid_output_ok="yes"
-    else
-      uhid_output_ok="no"
-    fi
-    if [ "$(status_value uhid_ready)" = "true" ] &&
-      [ "$(status_value uinput_ready)" = "true" ] &&
-      [ "$(status_value bluetooth_ready)" = "true" ] &&
-      [ -n "$(status_value bluetooth_hidraw)" ] &&
-      [ "$(status_number bluetooth_reports_read)" -gt 0 ] &&
-      [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
-      [ "$uhid_output_ok" = "yes" ] &&
-      [ "$(status_number uinput_events_emitted)" -gt 0 ]; then
-      echo "[guided] Probe startup confirmed."
-      return 0
-    fi
-    sleep 1
-  done
-
-  startup_failed "UHID, uinput, physical Bluetooth hidraw ownership, and active forwarding were not confirmed after 30 seconds"
-  return 1
-}
-
-startup_failed() {
-  local reason="$1"
-  echo "[guided] ERROR: $reason. The Diablo IV test will not continue."
-  printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
-  printf '%s\n' "$reason" >"$RUN_DIR/v0.5_invalid_reason.txt"
-  printf '%s\n' "$reason" >"$RUN_DIR/guided_gate_result.txt"
-  printf 'probe_start_failed: %s\n' "$reason" >"$RUN_DIR/diablo_test_result.txt"
-  echo "[guided] probe.log follows:"
-  echo "----------------------------------------"
-  cat "$PROBE_LOG" 2>/dev/null || true
-  echo "----------------------------------------"
-  restore_permissions || true
-  stop_probe
-  copy_summaries
-  finish_archive
 }
 
 input_node_matches_physical_bt() {
@@ -513,6 +453,13 @@ hidraw_node_matches_physical_bt() {
   grep -Eiq '^HID_ID=0005:0000054C:000009CC' "$sys/uevent" 2>/dev/null
 }
 
+node_is_active_physical_hidraw() {
+  local node="$1"
+  local active_hidraw
+  active_hidraw="$(status_value bluetooth_hidraw)"
+  [ -n "$active_hidraw" ] && [ "$node" = "$active_hidraw" ]
+}
+
 node_is_virtual_output() {
   local node="$1"
   local uinput_node uhid_hidraw_nodes uhid_input_nodes
@@ -524,13 +471,6 @@ node_is_virtual_output() {
     *",$node,"*) return 0 ;;
   esac
   return 1
-}
-
-node_is_active_physical_hidraw() {
-  local node="$1"
-  local active_hidraw
-  active_hidraw="$(status_value bluetooth_hidraw)"
-  [ -n "$active_hidraw" ] && [ "$node" = "$active_hidraw" ]
 }
 
 add_physical_node() {
@@ -581,34 +521,59 @@ discover_physical_nodes() {
   sed 's/^/[isolation]   /' "$DISCOVERED_NODES" || true
 }
 
-restrict_physical_nodes() {
-  echo
-  echo "Step 4:"
-  echo "[guided] Applying ACL-only isolation to physical Bluetooth DS4 nodes"
-  if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
-    isolation_failed "missing getfacl/setfacl/sudo; ACL-only isolation cannot run"
-    return 1
-  fi
+verify_required_virtual_nodes() {
+  local mode="$1"
+  local uinput_node uhid_hidraw_nodes uhid_input_nodes node found_uhid
+  uinput_node="$(status_value uinput_event_node)"
+  uhid_hidraw_nodes="$(status_value uhid_hidraw_nodes)"
+  uhid_input_nodes="$(status_value uhid_input_nodes)"
+  found_uhid=0
 
-  discover_physical_nodes
-  if [ ! -s "$DISCOVERED_NODES" ]; then
-    if [ "$GUIDED_MODE" = "stable-default" ]; then
-      echo "[isolation] stable-default found no evdev/js nodes to restrict; continuing with active hidraw untouched" | tee -a "$ISOLATION_LOG"
-      printf 'yes\n' >"$RUN_DIR/physical_isolation_success.txt"
-      printf 'no\n' >"$RUN_DIR/active_physical_hidraw_restricted.txt"
-      printf 'no\n' >"$RUN_DIR/evdev_js_nodes_restricted.txt"
-      return 0
-    else
-      isolation_failed "no physical Bluetooth DS4 nodes were discovered"
+  if [ "$(mode_uinput_enabled "$mode")" = "yes" ]; then
+    if [ -z "$uinput_node" ] || [ ! -e "$uinput_node" ]; then
+      echo "[isolation] virtual uinput node missing: ${uinput_node:-unknown}" | tee -a "$ISOLATION_LOG"
       return 1
     fi
   fi
 
-  : >"$RESTRICTED_NODES"
+  if [ "$(mode_uhid_enabled "$mode")" = "yes" ]; then
+    IFS=',' read -r -a nodes <<<"${uhid_hidraw_nodes},${uhid_input_nodes}"
+    for node in "${nodes[@]}"; do
+      [ -n "$node" ] || continue
+      if [ -e "$node" ]; then
+        found_uhid=1
+      fi
+    done
+    if [ "$found_uhid" -ne 1 ]; then
+      echo "[isolation] no virtual UHID node from bridge_status.txt is present" | tee -a "$ISOLATION_LOG"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+restrict_physical_nodes() {
+  local mode="$1"
+  echo
+  echo "[guided] Applying ACL-only physical Bluetooth evdev/js isolation for $mode"
+  if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
+    echo "[guided] ERROR: missing getfacl/setfacl/sudo; ACL-only isolation cannot run"
+    return 1
+  fi
+
+  discover_physical_nodes
   printf 'no\n' >"$RUN_DIR/active_physical_hidraw_restricted.txt"
   printf 'no\n' >"$RUN_DIR/evdev_js_nodes_restricted.txt"
-  local count=0
-  local kind node syspath acl_file stat_file
+  : >"$RESTRICTED_NODES"
+
+  if [ ! -s "$DISCOVERED_NODES" ]; then
+    echo "[isolation] no physical evdev/js nodes to restrict; continuing with active hidraw untouched" | tee -a "$ISOLATION_LOG"
+    printf 'yes\n' >"$RUN_DIR/physical_isolation_success.txt"
+    return 0
+  fi
+
+  local count kind node syspath acl_file stat_file
+  count="$(awk 'NR > 1 && NF { count++ } END { print count + 0 }' "$MANIFEST" 2>/dev/null || echo 0)"
   while IFS=$'\t' read -r kind node syspath; do
     [ -n "$node" ] || continue
     count=$((count + 1))
@@ -616,7 +581,7 @@ restrict_physical_nodes() {
     stat_file="$PERM_DIR/stat-$count-$(basename "$node").txt"
 
     if ! getfacl -p "$node" >"$acl_file" 2>>"$ISOLATION_LOG"; then
-      isolation_failed "could not back up ACL for $node"
+      echo "[guided] ERROR: could not back up ACL for $node"
       return 1
     fi
     stat -Lc 'node=%n owner=%U group=%G mode=%a type=%F major_minor=%t:%T' "$node" >"$stat_file" 2>>"$ISOLATION_LOG" || true
@@ -624,11 +589,11 @@ restrict_physical_nodes() {
 
     echo "[isolation] restricting $node for user $TARGET_USER" | tee -a "$ISOLATION_LOG"
     if ! setfacl -m "u:${TARGET_USER}:---" "$node" >>"$ISOLATION_LOG" 2>&1; then
-      isolation_failed "setfacl failed for $node"
+      echo "[guided] ERROR: setfacl failed for $node"
       return 1
     fi
     if sudo -u "$TARGET_USER" test -r "$node" 2>/dev/null || sudo -u "$TARGET_USER" test -w "$node" 2>/dev/null; then
-      isolation_failed "target user can still access $node after ACL restriction"
+      echo "[guided] ERROR: target user can still access $node after ACL restriction"
       return 1
     fi
     if [ "$kind" = "hidraw" ] && node_is_active_physical_hidraw "$node"; then
@@ -640,316 +605,417 @@ restrict_physical_nodes() {
     printf '%s\t%s\t%s\n' "$kind" "$node" "$syspath" >>"$RESTRICTED_NODES"
   done <"$DISCOVERED_NODES"
 
-  if ! verify_virtual_nodes_present; then
-    isolation_failed "virtual UHID/uinput nodes were not still visible after isolation"
+  if ! verify_required_virtual_nodes "$mode"; then
+    echo "[guided] ERROR: required virtual output nodes are missing after isolation"
     return 1
   fi
 
   printf 'yes\n' >"$RUN_DIR/physical_isolation_success.txt"
-  printf 'yes\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
-  printf 'none\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
-  printf 'ready\n' >"$RUN_DIR/guided_gate_result.txt"
-  echo "[guided] Physical Bluetooth isolation confirmed."
+  return 0
 }
 
-print_pre_diablo_check() {
-  echo
-  echo "Pre-Diablo readiness check:"
-  echo "  UHID virtual DS4 ready: $(status_value uhid_ready)"
-  echo "  uinput fallback ready: $(status_value uinput_ready)"
-  if [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ]; then
-    echo "  Bluetooth reports forwarding: yes"
-  else
-    echo "  Bluetooth reports forwarding: no"
+snapshot_mode_runtime() {
+  local mode="$1"
+  local mode_dir="$MODES_DIR/$mode"
+  mkdir -p "$mode_dir"
+  cp "$STATUS_FILE" "$mode_dir/bridge_status_snapshot.txt" 2>/dev/null || true
+  cp "$DISCOVERED_NODES" "$mode_dir/discovered_physical_bt_nodes.tsv" 2>/dev/null || true
+  cp "$RESTRICTED_NODES" "$mode_dir/restricted_nodes.tsv" 2>/dev/null || true
+  printf '%s\n' "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)" >"$mode_dir/physical_isolation_success.txt"
+  printf '%s\n' "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" >"$mode_dir/active_physical_hidraw_restricted.txt"
+  printf '%s\n' "$(cat "$RUN_DIR/evdev_js_nodes_restricted.txt" 2>/dev/null || echo no)" >"$mode_dir/physical_bt_evdev_js_isolated.txt"
+}
+
+probe_alive_for_mode() {
+  local mode="$1"
+  [ -n "$PROBE_PID" ] && kill -0 "$PROBE_PID" >/dev/null 2>&1 || return 1
+  [ "$(status_value bluetooth_ready)" = "true" ] || return 1
+  [ -n "$(status_value bluetooth_hidraw)" ] || return 1
+  [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] || return 1
+  [ "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" != "yes" ] || return 1
+  [ "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)" = "yes" ] || return 1
+  if [ "$(mode_uhid_enabled "$mode")" = "yes" ]; then
+    [ "$(status_value uhid_ready)" = "true" ] || return 1
+    [ -n "$(status_value uhid_hidraw_nodes)$(status_value uhid_input_nodes)" ] || return 1
   fi
-  echo "  physical BT isolation active: $(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null || echo no)"
-  echo "  internal UHID touchpad decoder clean: $(status_value touchpad_idle_clean)"
-  echo "  external UHID event touchpad idle clean: $(cat "$RUN_DIR/uhid_event_touchpad_idle_clean.txt" 2>/dev/null || echo unchecked)"
-  echo "  UHID event monitor status: $(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null || echo unchecked)"
-  echo "  UHID touchpad idle samples checked: $(status_number touchpad_idle_samples_checked)"
-  echo "  UHID active touch contacts emitted: $(status_number touchpad_active_contacts_emitted)"
-  echo "  uinput event node: $(status_value uinput_event_node)"
-  echo "  uinput event monitor available: $(cat "$RUN_DIR/uinput_event_monitor_available.txt" 2>/dev/null || echo unchecked)"
-  echo "  uinput events seen: $(cat "$RUN_DIR/uinput_events_seen.txt" 2>/dev/null || echo 0)"
-  echo "  uinput buttons/sticks validation: $(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null || echo unchecked)"
-  echo "  active physical hidraw restricted: $(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)"
-  echo "  selected runtime mode: $SELECTED_RUNTIME_MODE"
+  if [ "$(mode_uinput_enabled "$mode")" = "yes" ]; then
+    [ "$(status_value uinput_ready)" = "true" ] || return 1
+    [ -n "$(status_value uinput_event_node)" ] || return 1
+  fi
+  return 0
 }
 
-select_uhid_event_node() {
-  local uinput_node uhid_input_nodes node
-  uinput_node="$(status_value uinput_event_node)"
-  uhid_input_nodes="$(status_value uhid_input_nodes)"
-  IFS=',' read -r -a nodes <<<"$uhid_input_nodes"
-  for node in "${nodes[@]}"; do
-    [ -n "$node" ] || continue
-    [ "$node" != "$uinput_node" ] || continue
-    [ -e "$node" ] || continue
-    printf '%s\n' "$node"
-    return 0
+start_probe_for_mode() {
+  local mode="$1"
+  local probe_arg identity_only
+
+  CURRENT_MODE="$mode"
+  CURRENT_MODE_DIR="$MODES_DIR/$mode"
+  STATUS_FILE="$CURRENT_MODE_DIR/bridge_status.txt"
+  PROBE_LOG="$CURRENT_MODE_DIR/probe.log"
+  mkdir -p "$CURRENT_MODE_DIR"
+  : >"$STATUS_FILE"
+  : >"$PROBE_LOG"
+  printf '%s\n' "$mode" >>"$RUN_DIR/modes_attempted.txt"
+  printf '%s\n' "$(mode_uhid_enabled "$mode")" >"$CURRENT_MODE_DIR/uhid_enabled.txt"
+  printf '%s\n' "$(mode_identity_only "$mode")" >"$CURRENT_MODE_DIR/uhid_identity_only.txt"
+  printf '%s\n' "$(mode_uinput_enabled "$mode")" >"$CURRENT_MODE_DIR/uinput_enabled.txt"
+  mode_description "$mode" >"$CURRENT_MODE_DIR/description.txt"
+
+  echo
+  echo "============================================================"
+  echo "[guided] Starting mode: $mode"
+  echo "[guided] $(mode_description "$mode")"
+  echo "============================================================"
+
+  if [ "$(mode_uhid_enabled "$mode")" = "yes" ]; then
+    if [ ! -e /dev/uhid ]; then
+      echo "[guided] ERROR: /dev/uhid does not exist. Try: sudo modprobe uhid"
+      printf 'startup_failed_no_uhid\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+      return 1
+    fi
+    if [ ! -w /dev/uhid ]; then
+      echo "[guided] ERROR: /dev/uhid is not writable by root."
+      printf 'startup_failed_uhid_not_writable\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+      return 1
+    fi
+  fi
+
+  if [ "$(mode_uinput_enabled "$mode")" = "yes" ]; then
+    prepare_uinput
+  fi
+
+  probe_arg="$(mode_probe_arg "$mode")"
+  identity_only="$(mode_identity_only "$mode")"
+  DS4_UHID_IDENTITY_ONLY="$identity_only" \
+    DS4_TOUCHPAD_MODE="hard-disabled" \
+    DS4_RAW_CAPTURE_DIR="$CURRENT_MODE_DIR/raw_bluetooth_reports" \
+    DS4_STATUS_FILE="$STATUS_FILE" \
+    "$ROOT_DIR/scripts/run_probe.sh" "$probe_arg" >"$PROBE_LOG" 2>&1 &
+  PROBE_PID=$!
+
+  echo "$PROBE_PID" >"$CURRENT_MODE_DIR/probe.pid"
+  echo "[guided] Probe PID: $PROBE_PID"
+  echo "[guided] Probe output: $PROBE_LOG"
+
+  local attempt uhid_ok uinput_ok uhid_output_ok
+  for attempt in $(seq 1 30); do
+    if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
+      echo "[guided] ERROR: probe process exited early in mode $mode"
+      printf 'startup_failed_probe_exited\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+      cat "$PROBE_LOG" 2>/dev/null || true
+      return 1
+    fi
+
+    uhid_ok="yes"
+    if [ "$(mode_uhid_enabled "$mode")" = "yes" ]; then
+      uhid_ok="no"
+      uhid_output_ok="yes"
+      if [ "$(mode_identity_only "$mode")" != "yes" ] && [ "$(status_number uhid_reports_emitted)" -eq 0 ]; then
+        uhid_output_ok="no"
+      fi
+      if [ "$(status_value uhid_ready)" = "true" ] &&
+        [ -n "$(status_value uhid_hidraw_nodes)$(status_value uhid_input_nodes)" ] &&
+        [ "$uhid_output_ok" = "yes" ]; then
+        uhid_ok="yes"
+      fi
+    fi
+
+    uinput_ok="yes"
+    if [ "$(mode_uinput_enabled "$mode")" = "yes" ]; then
+      uinput_ok="no"
+      if [ "$(status_value uinput_ready)" = "true" ] &&
+        [ -n "$(status_value uinput_event_node)" ] &&
+        [ "$(status_number uinput_events_emitted)" -gt 0 ]; then
+        uinput_ok="yes"
+      fi
+    fi
+
+    if [ "$uhid_ok" = "yes" ] &&
+      [ "$uinput_ok" = "yes" ] &&
+      [ "$(status_value bluetooth_ready)" = "true" ] &&
+      [ -n "$(status_value bluetooth_hidraw)" ] &&
+      [ "$(status_number bluetooth_reports_read)" -gt 0 ] &&
+      [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ]; then
+      echo "[guided] Probe startup confirmed for $mode."
+      return 0
+    fi
+    sleep 1
   done
+
+  echo "[guided] ERROR: startup checks did not pass for $mode"
+  printf 'startup_failed_readiness\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+  cat "$PROBE_LOG" 2>/dev/null || true
   return 1
 }
 
-monitor_uhid_touchpad_idle() {
-  local runtime_mode="$1"
+monitor_uhid_touchpad_idle_if_present() {
+  local mode="$1"
   local event_node probe_bin output_dir status_file clean events samples
-  event_node="$(select_uhid_event_node || true)"
-  output_dir="$MONITOR_DIR/$runtime_mode"
+  output_dir="$CURRENT_MODE_DIR/uhid_event_touchpad_monitor"
   mkdir -p "$output_dir"
-  if [ -z "$event_node" ]; then
-    printf '0\n' >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
-    printf 'none\n' >"$RUN_DIR/uhid_event_touchpad_event_samples.txt"
-    if [ "$runtime_mode" = "identity-only-uhid" ] &&
-      [ "$(status_value uhid_identity_only)" = "true" ] &&
-      [ "$(status_value uinput_ready)" = "true" ]; then
-      echo "[guided] UHID is running as identity-only. No UHID input event node is required. Gameplay input will be tested through the uinput event node."
-      printf 'not_applicable_identity_only\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
-      printf 'not_applicable_identity_only\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
-      printf 'yes\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
-      return 0
-    fi
-    echo "[guided] Full UHID event monitor unavailable: no UHID virtual DS4 event node was found. Trying identity-only mode."
-    printf 'unavailable\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
-    printf '0\n' >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
-    printf 'missing UHID event node\n' >"$RUN_DIR/uhid_event_touchpad_invalid_reason.txt"
-    printf 'missing\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
-    printf 'no\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
-    return 1
+  if [ "$(mode_uhid_enabled "$mode")" != "yes" ]; then
+    printf 'not_applicable_uinput_only\n' >"$CURRENT_MODE_DIR/uhid_event_monitor_status.txt"
+    return 0
   fi
-  printf 'no\n' >"$RUN_DIR/identity_only_missing_uhid_event_node_allowed.txt"
-  printf '%s\n' "$event_node" >"$RUN_DIR/uhid_event_node.txt"
-  echo
-  echo "[guided] External UHID event touchpad idle monitor"
-  echo "[guided] Do not touch the controller for this short check."
-  echo "[guided] Monitoring $event_node for touchpad events."
+
+  event_node="$(mode_status_value "$mode" uhid_input_nodes | awk -F, '{print $1}')"
+  if [ -z "$event_node" ] || [ ! -e "$event_node" ]; then
+    printf 'missing\n' >"$CURRENT_MODE_DIR/uhid_event_monitor_status.txt"
+    printf '0\n' >"$CURRENT_MODE_DIR/uhid_event_touchpad_events_seen.txt"
+    return 0
+  fi
   probe_bin="$(find_probe_binary || true)"
   if [ -z "$probe_bin" ]; then
-    echo "[guided] ERROR: probe binary unavailable; cannot run external touchpad event monitor"
-    printf 'no\n' >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
-    printf '0\n' >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
-    printf 'probe binary unavailable\n' >"$RUN_DIR/uhid_event_touchpad_invalid_reason.txt"
-    return 1
+    printf 'probe_unavailable\n' >"$CURRENT_MODE_DIR/uhid_event_monitor_status.txt"
+    return 0
   fi
+  echo "[guided] Optional UHID touchpad idle event monitor for $event_node"
   "$probe_bin" monitor-touchpad-events \
     --event "$event_node" \
     --output-dir "$output_dir" \
-    --duration-ms 7000 \
-    >"$output_dir/monitor.log" 2>&1
+    --duration-ms 5000 \
+    >"$output_dir/monitor.log" 2>&1 || true
   status_file="$output_dir/status.txt"
   clean="$(sed -n 's/^uhid_event_touchpad_idle_clean=//p' "$status_file" 2>/dev/null | tail -n 1)"
   events="$(sed -n 's/^uhid_event_touchpad_events_seen=//p' "$status_file" 2>/dev/null | tail -n 1)"
   samples="$(sed -n 's/^uhid_event_touchpad_event_samples=//p' "$status_file" 2>/dev/null | tail -n 1)"
-  printf '%s\n' "${clean:-no}" >"$RUN_DIR/uhid_event_touchpad_idle_clean.txt"
-  printf '%s\n' "${events:-0}" >"$RUN_DIR/uhid_event_touchpad_events_seen.txt"
-  printf '%s\n' "${samples:-$output_dir/touchpad-events.txt}" >"$RUN_DIR/uhid_event_touchpad_event_samples.txt"
-  echo "[guided] UHID event touchpad idle clean: ${clean:-no}"
-  echo "[guided] UHID event touchpad events seen: ${events:-0}"
+  printf '%s\n' "${clean:-unknown}" >"$CURRENT_MODE_DIR/uhid_event_touchpad_idle_clean.txt"
+  printf '%s\n' "${events:-0}" >"$CURRENT_MODE_DIR/uhid_event_touchpad_events_seen.txt"
+  printf '%s\n' "${samples:-$output_dir/touchpad-events.txt}" >"$CURRENT_MODE_DIR/uhid_event_touchpad_event_samples.txt"
   if [ "${clean:-no}" = "yes" ]; then
-    printf 'clean\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+    printf 'clean\n' >"$CURRENT_MODE_DIR/uhid_event_monitor_status.txt"
+  else
+    printf 'dirty_or_unknown\n' >"$CURRENT_MODE_DIR/uhid_event_monitor_status.txt"
+  fi
+}
+
+ask_steam_tester_for_mode() {
+  local mode="$1"
+  echo
+  echo "[guided] Steam Controller Tester checkpoint for mode: $mode"
+  echo "[guided] Open Steam Controller Tester now. Make sure you are testing the controller entry created by this mode."
+  echo "[guided] If Steam shows more than one controller, note that clearly below."
+  if ! wait_for_enter_while_probe_alive "Press Enter after Steam Controller Tester is open and checked."; then
+    return 1
+  fi
+  ask_choice "How many controllers does Steam show?" "$CURRENT_MODE_DIR/steam_controller_count.txt" 0 1 "2+" unsure
+  ask_choice "Which controller entry are you testing?" "$CURRENT_MODE_DIR/steam_controller_entry_tested.txt" first second only unsure
+  ask_yn_unsure "Permanent touchpad contact?" "$CURRENT_MODE_DIR/steam_tester_permanent_touchpad_contact.txt"
+  ask_yn_unsure "Buttons/sticks worked?" "$CURRENT_MODE_DIR/steam_tester_buttons_sticks_worked.txt"
+  ask_yn_unsure "Duplicate controller confusion?" "$CURRENT_MODE_DIR/steam_duplicate_controller_confusion.txt"
+}
+
+steam_gate_passed() {
+  local mode="$1"
+  local count touch buttons confusion
+  count="$(cat "$CURRENT_MODE_DIR/steam_controller_count.txt" 2>/dev/null || echo unsure)"
+  touch="$(cat "$CURRENT_MODE_DIR/steam_tester_permanent_touchpad_contact.txt" 2>/dev/null || echo unsure)"
+  buttons="$(cat "$CURRENT_MODE_DIR/steam_tester_buttons_sticks_worked.txt" 2>/dev/null || echo unsure)"
+  confusion="$(cat "$CURRENT_MODE_DIR/steam_duplicate_controller_confusion.txt" 2>/dev/null || echo unsure)"
+  [ "$touch" = "no" ] || return 1
+  [ "$buttons" = "yes" ] || return 1
+  if [ "$mode" = "full-uhid-only" ] && [ "$count" = "2+" ] && [ "$confusion" != "no" ]; then
+    return 1
+  fi
+  return 0
+}
+
+ask_diablo_for_mode() {
+  local mode="$1"
+  echo
+  echo "[guided] Diablo IV checkpoint for mode: $mode"
+  echo "[guided] Launch Steam if needed, make sure Steam Input is disabled for Diablo IV, launch Diablo IV, and test this same controller entry."
+  if ! wait_for_enter_while_probe_alive "Press Enter after you have checked Diablo IV."; then
+    return 1
+  fi
+  printf 'yes\n' >"$RUN_DIR/valid_diablo_test.txt"
+  ask_yn_unsure "Did Diablo IV detect a controller?" "$CURRENT_MODE_DIR/diablo_controller_detected.txt"
+  ask_yn_unsure "Did PlayStation glyphs appear?" "$CURRENT_MODE_DIR/diablo_playstation_glyphs.txt"
+  ask_yn_unsure "Did input work?" "$CURRENT_MODE_DIR/diablo_input_worked.txt"
+  ask_yn_unsure "Duplicate input?" "$CURRENT_MODE_DIR/diablo_duplicate_input.txt"
+}
+
+evaluate_mode_after_diablo() {
+  local mode="$1"
+  local detected glyphs input duplicate
+  detected="$(cat "$CURRENT_MODE_DIR/diablo_controller_detected.txt" 2>/dev/null || echo unsure)"
+  glyphs="$(cat "$CURRENT_MODE_DIR/diablo_playstation_glyphs.txt" 2>/dev/null || echo unsure)"
+  input="$(cat "$CURRENT_MODE_DIR/diablo_input_worked.txt" 2>/dev/null || echo unsure)"
+  duplicate="$(cat "$CURRENT_MODE_DIR/diablo_duplicate_input.txt" 2>/dev/null || echo unsure)"
+
+  if [ "$detected" = "yes" ] && [ "$input" = "yes" ] && [ "$glyphs" = "yes" ]; then
+    printf 'success\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    FINAL_CONCLUSION="success"
+    SELECTED_FINAL_MODE="$mode"
+    printf '%s\n' "$FINAL_CONCLUSION" >"$RUN_DIR/final_conclusion.txt"
+    printf '%s\n' "$SELECTED_FINAL_MODE" >"$RUN_DIR/selected_final_mode.txt"
     return 0
   fi
-  if [ "$runtime_mode" = "full-uhid-input" ]; then
-    printf 'full_mode_dirty\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+
+  if [ "$detected" = "yes" ] && [ "$input" = "yes" ]; then
+    if [ "$mode" = "uinput-only" ]; then
+      printf 'input_only_success_no_glyphs\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+      INPUT_ONLY_SUCCESS_MODE="$mode"
+    else
+      printf 'functional_input_no_glyphs\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    fi
+  elif [ "$mode" = "full-uhid-only" ]; then
+    printf 'Diablo/Proton refused clean controller\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    CLEAN_CONTROLLER_REFUSED="yes"
+  elif [ "$duplicate" = "yes" ]; then
+    printf 'duplicate_input_reported\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
   else
-    printf 'identity_only_dirty\n' >"$RUN_DIR/uhid_event_monitor_status.txt"
+    printf 'diablo_failed\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
   fi
   return 1
 }
 
-validate_uinput_activity() {
-  local event_node probe_bin output_dir status_file available events validation samples
-  event_node="$(status_value uinput_event_node)"
-  output_dir="$UINPUT_MONITOR_DIR/$SELECTED_RUNTIME_MODE"
-  mkdir -p "$output_dir"
-  if [ -z "$event_node" ] || [ ! -e "$event_node" ]; then
-    echo "[guided] ERROR: uinput event node is unavailable: ${event_node:-unknown}"
-    printf 'no\n' >"$RUN_DIR/uinput_event_monitor_available.txt"
-    printf '0\n' >"$RUN_DIR/uinput_events_seen.txt"
-    printf 'fail\n' >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
+try_mode() {
+  local mode="$1"
+  if ! start_probe_for_mode "$mode"; then
+    stop_probe
+    restore_permissions || true
     return 1
   fi
-  printf '%s\n' "$event_node" >"$RUN_DIR/uinput_event_node.txt"
-  probe_bin="$(find_probe_binary || true)"
-  if [ -z "$probe_bin" ]; then
-    echo "[guided] ERROR: probe binary unavailable; cannot validate uinput events"
-    printf 'no\n' >"$RUN_DIR/uinput_event_monitor_available.txt"
-    printf '0\n' >"$RUN_DIR/uinput_events_seen.txt"
-    printf 'unknown\n' >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
-    return 1
+  if ! restrict_physical_nodes "$mode"; then
+    printf 'isolation_failed\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    snapshot_mode_runtime "$mode"
+    fatal_archive "physical Bluetooth evdev/js isolation failed in mode $mode"
   fi
-  echo
-  echo "[guided] uinput gameplay-path validation"
-  echo "[guided] Move both sticks and press a few controller buttons for the next 7 seconds."
-  "$probe_bin" monitor-input-events \
-    --event "$event_node" \
-    --output-dir "$output_dir" \
-    --duration-ms 7000 \
-    >"$output_dir/monitor.log" 2>&1
-  status_file="$output_dir/status.txt"
-  available="$(sed -n 's/^uinput_event_monitor_available=//p' "$status_file" 2>/dev/null | tail -n 1)"
-  events="$(sed -n 's/^uinput_events_seen=//p' "$status_file" 2>/dev/null | tail -n 1)"
-  validation="$(sed -n 's/^uinput_buttons_sticks_validation=//p' "$status_file" 2>/dev/null | tail -n 1)"
-  samples="$(sed -n 's/^uinput_event_samples=//p' "$status_file" 2>/dev/null | tail -n 1)"
-  printf '%s\n' "${available:-no}" >"$RUN_DIR/uinput_event_monitor_available.txt"
-  printf '%s\n' "${events:-0}" >"$RUN_DIR/uinput_events_seen.txt"
-  printf '%s\n' "${validation:-unknown}" >"$RUN_DIR/uinput_buttons_sticks_validation.txt"
-  printf '%s\n' "${samples:-$output_dir/input-events.txt}" >"$RUN_DIR/uinput_event_samples.txt"
-  echo "[guided] uinput event monitor available: ${available:-no}"
-  echo "[guided] uinput events seen: ${events:-0}"
-  echo "[guided] uinput buttons/sticks validation: ${validation:-unknown}"
-  [ "${available:-no}" = "yes" ] && [ "${validation:-unknown}" = "pass" ]
-}
+  snapshot_mode_runtime "$mode"
+  monitor_uhid_touchpad_idle_if_present "$mode"
 
-pre_diablo_stability_gate() {
-  local runtime_mode="$1"
-  local wait_attempt
   echo
-  echo "[guided] Running pre-Diablo bridge stability gate"
-  for wait_attempt in $(seq 1 10); do
-    if ! kill -0 "$PROBE_PID" >/dev/null 2>&1; then
-      printf 'no\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
-      startup_failed "bridge exited before the Diablo IV step"
-      return 1
-    fi
-    sleep 1
-  done
-  if [ "$(status_value uhid_ready)" = "true" ] &&
-    [ -n "$(status_value uhid_hidraw_nodes)" ] &&
-    [ "$(status_value uinput_ready)" = "true" ] &&
-    [ -n "$(status_value uinput_event_node)" ] &&
-    [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
-    [ "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" != "yes" ]; then
-    printf 'yes\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
-    BRIDGE_STABLE_PRE_DIABLO="yes"
+  echo "[guided] Mode ready: $mode"
+  echo "[guided] UHID enabled: $(mode_uhid_enabled "$mode")"
+  echo "[guided] uinput enabled: $(mode_uinput_enabled "$mode")"
+  echo "[guided] active physical hidraw restricted: $(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)"
+  echo "[guided] Bluetooth reports forwarded: $(status_number bluetooth_reports_forwarded)"
+
+  if ! ask_steam_tester_for_mode "$mode"; then
+    printf 'Steam Tester failed\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    stop_probe
+    restore_permissions || true
+    return 1
+  fi
+
+  if steam_gate_passed "$mode"; then
+    printf 'yes\n' >"$CURRENT_MODE_DIR/steam_gate_passed.txt"
+    ANY_STEAM_PASS="yes"
   else
-    printf 'no\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
-    startup_failed "bridge stability checks did not pass before Diablo IV"
-    return 1
-  fi
-  if ! monitor_uhid_touchpad_idle "$runtime_mode"; then
-    print_pre_diablo_check
-    return 1
-  fi
-  if ! validate_uinput_activity; then
-    print_pre_diablo_check
-    printf 'no\n' >"$RUN_DIR/bridge_stable_pre_diablo.txt"
-    return 1
-  fi
-  print_pre_diablo_check
-  return 0
-}
-
-verify_virtual_nodes_present() {
-  local uinput_node uhid_hidraw_nodes uhid_input_nodes node found_uhid
-  uinput_node="$(status_value uinput_event_node)"
-  uhid_hidraw_nodes="$(status_value uhid_hidraw_nodes)"
-  uhid_input_nodes="$(status_value uhid_input_nodes)"
-  found_uhid=0
-
-  if [ -z "$uinput_node" ] || [ ! -e "$uinput_node" ]; then
-    echo "[isolation] virtual uinput node missing: ${uinput_node:-unknown}" | tee -a "$ISOLATION_LOG"
+    printf 'no\n' >"$CURRENT_MODE_DIR/steam_gate_passed.txt"
+    printf 'Steam Tester failed\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    echo "[guided] Steam Tester gate did not pass for $mode."
+    stop_probe
+    restore_permissions || true
     return 1
   fi
 
-  IFS=',' read -r -a nodes <<<"${uhid_hidraw_nodes},${uhid_input_nodes}"
-  for node in "${nodes[@]}"; do
-    [ -n "$node" ] || continue
-    if [ -e "$node" ]; then
-      found_uhid=1
-    fi
-  done
-  if [ "$found_uhid" -ne 1 ]; then
-    echo "[isolation] no virtual UHID node from bridge_status.txt is present" | tee -a "$ISOLATION_LOG"
+  if ! ask_diablo_for_mode "$mode"; then
+    printf 'diablo_step_interrupted\n' >"$CURRENT_MODE_DIR/mode_conclusion.txt"
+    stop_probe
+    restore_permissions || true
     return 1
   fi
-  return 0
-}
 
-isolation_failed() {
-  local reason="$1"
-  echo "[guided] ERROR: v0.5.2 was not a valid Diablo test because physical Bluetooth isolation failed: $reason"
-  printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-  printf 'no\n' >"$RUN_DIR/physical_isolation_success.txt"
-  printf 'no\n' >"$RUN_DIR/v0.5_valid_diablo_test.txt"
-  printf 'physical isolation failed: %s\n' "$reason" >"$RUN_DIR/v0.5_invalid_reason.txt"
-  printf 'physical isolation failed: %s\n' "$reason" >"$RUN_DIR/guided_gate_result.txt"
-  restore_permissions || true
+  if evaluate_mode_after_diablo "$mode"; then
+    echo "[guided] Full success in mode $mode."
+    stop_probe
+    restore_permissions || true
+    return 0
+  fi
+
   stop_probe
-  copy_summaries
-  finish_archive
-}
-
-uhid_event_gate_accepted() {
-  local monitor_status
-  monitor_status="$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null)"
-  [ "$monitor_status" = "clean" ] || [ "$monitor_status" = "not_applicable_identity_only" ]
-}
-
-ensure_probe_alive() {
-  if [ -n "$PROBE_PID" ] &&
-    kill -0 "$PROBE_PID" >/dev/null 2>&1 &&
-    [ "$(status_value uhid_ready)" = "true" ] &&
-    [ -n "$(status_value uhid_hidraw_nodes)" ] &&
-    [ "$(status_value uinput_ready)" = "true" ] &&
-    [ -n "$(status_value uinput_event_node)" ] &&
-    [ "$(status_number bluetooth_reports_forwarded)" -gt 0 ] &&
-    [ "$(cat "$RUN_DIR/active_physical_hidraw_restricted.txt" 2>/dev/null || echo no)" != "yes" ] &&
-    [ "$(cat "$RUN_DIR/physical_isolation_success.txt" 2>/dev/null)" = "yes" ] &&
-    [ "$(cat "$RUN_DIR/uinput_buttons_sticks_validation.txt" 2>/dev/null)" = "pass" ] &&
-    uhid_event_gate_accepted; then
-    return 0
-  fi
-  startup_failed "probe, bridge, physical Bluetooth isolation, external UHID event status, or uinput validation failed during the Diablo IV test"
+  restore_permissions || true
   return 1
 }
 
-ask_result() {
-  local prompt="$1"
-  local output="$2"
-  local answer=""
-  echo
-  while true; do
-    read -r -p "$prompt yes/no/unsure: " answer
-    case "${answer,,}" in
-      yes|no|unsure)
-        printf '%s\n' "${answer,,}" >"$RUN_DIR/$output"
-        return 0
-        ;;
-      *)
-        echo "Please answer yes, no, or unsure."
-        ;;
-    esac
-  done
+choose_final_conclusion() {
+  if [ -n "$FINAL_CONCLUSION" ]; then
+    return 0
+  fi
+  if [ -n "$INPUT_ONLY_SUCCESS_MODE" ]; then
+    FINAL_CONCLUSION="input_only_success_no_glyphs"
+    SELECTED_FINAL_MODE="$INPUT_ONLY_SUCCESS_MODE"
+  elif [ "$CLEAN_CONTROLLER_REFUSED" = "yes" ]; then
+    FINAL_CONCLUSION="Diablo/Proton refused clean controller"
+    SELECTED_FINAL_MODE="full-uhid-only"
+  elif [ "$ANY_STEAM_PASS" != "yes" ]; then
+    FINAL_CONCLUSION="Steam Tester failed"
+    SELECTED_FINAL_MODE="none"
+  else
+    FINAL_CONCLUSION="inconclusive"
+    SELECTED_FINAL_MODE="none"
+  fi
+  printf '%s\n' "$FINAL_CONCLUSION" >"$RUN_DIR/final_conclusion.txt"
+  printf '%s\n' "$SELECTED_FINAL_MODE" >"$RUN_DIR/selected_final_mode.txt"
 }
 
-copy_summaries() {
-  mkdir -p "$RUN_DIR/summaries"
-  for mode in usb bluetooth; do
-    if [ -f "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt" ]; then
-      cp "$CAPTURE_ROOT/$TIMESTAMP/$mode/identity/summary.txt" "$RUN_DIR/summaries/${mode}_summary.txt" 2>/dev/null || true
-    fi
-  done
-}
+cat >"$RUN_DIR/expected_virtual_identity.txt" <<'EOF'
+Expected virtual Proton-visible identity for UHID modes:
+HID_ID=0003:0000054C:000009CC
+HID_NAME=Sony Interactive Entertainment Wireless Controller
+bus_type=1
+input_report=0x01, 64-byte USB-style DS4
 
+Expected uinput fallback identity where enabled:
+bus=BUS_USB
+vendor=0x054c
+product=0x09cc
+name=Sony Interactive Entertainment Wireless Controller
+
+Physical Bluetooth comparison:
+HID_ID=0005:0000054C:000009CC
+bus_type=2
+input_report=0x11, 78-byte Bluetooth DS4
+EOF
+
+cat >"$PROTON_NOTES" <<'EOF'
+Proton visibility notes
+=======================
+v0.6 is a final convergence attempt. It tries modes in order and prioritizes one usable controller path:
+  A. full-uhid-only
+  B. full-uhid-plus-uinput-hidden
+  C. uinput-only
+  D. identity-only-uhid-plus-uinput
+
+The primary target is Mode A: one UHID Sony DS4 with working buttons/sticks and no permanent touchpad contact.
+Identity-only UHID plus uinput is diagnostic only because v0.5.2 was duplicate-prone.
+EOF
+
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  fatal_archive "could not determine the normal Steam user; rerun with sudo from the Steam user's terminal or set DS4_TEST_USER=<username>"
+fi
+if ! id "$TARGET_USER" >/dev/null 2>&1; then
+  fatal_archive "target user does not exist: $TARGET_USER"
+fi
 if ! command -v getfacl >/dev/null 2>&1 || ! command -v setfacl >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
-  copy_summaries
-  finish_archive
-  exit 1
+  fatal_archive "v0.6 requires getfacl, setfacl, and sudo for temporary ACL isolation"
 fi
 
-echo "DS4 Bluetooth/USB Probe Guided Test v0.5.2"
+echo "DS4 Bluetooth/USB Probe Guided Test v0.6"
 echo "========================================"
 echo
-echo "This script collects USB/Bluetooth identity, starts the UHID + uinput bridge,"
-echo "temporarily hides the original physical Bluetooth DS4 from user $TARGET_USER with ACLs,"
-echo "asks you to test Diablo IV, restores permissions, and creates one archive to send back."
+echo "This script collects USB/Bluetooth identity, then tries a clear runtime mode ladder."
+echo "Primary mode is full-uhid-only: UHID Sony DS4 input, hard-disabled touchpad, no uinput device."
+echo "Fallback modes are diagnostic and are clearly labeled before you test them."
 echo
 echo "[guided] project root: $ROOT_DIR"
 echo "[guided] capture folder: $RUN_DIR"
 echo "[guided] target Steam/Proton user: $TARGET_USER"
 echo
-echo "Important: close Steam completely before continuing. The script will tell you when to launch Steam again."
+echo "Important: close Steam completely before continuing. The script will tell you when to launch Steam/Controller Tester again."
+
+if [ ! -e /dev/uhid ] || [ ! -w /dev/uhid ]; then
+  echo "[guided] WARNING: /dev/uhid is missing or not writable. Trying: modprobe uhid"
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe uhid 2>&1 || true
+  fi
+  if [ ! -e /dev/uhid ] || [ ! -w /dev/uhid ]; then
+    echo "[guided] WARNING: UHID modes will fail, but uinput-only diagnostic mode can still be attempted."
+  fi
+fi
 
 pause_for_enter "Before Step 1: Close Steam completely, then press Enter."
 
@@ -959,96 +1025,19 @@ run_capture_step usb
 pause_for_enter "Step 2: Disconnect USB, connect the controller by Bluetooth, then press Enter."
 run_capture_step bluetooth
 
-prepare_uinput
-
-if ! start_probe full-uhid-input; then
-  exit 1
-fi
-
-if ! restrict_physical_nodes; then
-  exit 1
-fi
-
-if ! pre_diablo_stability_gate full-uhid-input; then
-  full_monitor_status="$(cat "$RUN_DIR/uhid_event_monitor_status.txt" 2>/dev/null)"
-  if [ "$full_monitor_status" = "full_mode_dirty" ] || [ "$full_monitor_status" = "missing" ]; then
-    if [ "$full_monitor_status" = "missing" ]; then
-      echo "[guided] Full UHID event monitor is unavailable; trying identity-only UHID fallback."
-    else
-      echo "[guided] Full UHID input emits touchpad events at idle; trying identity-only UHID fallback."
-    fi
-    stop_probe
-    restore_permissions || true
-    if ! start_probe identity-only-uhid; then
-      exit 1
-    fi
-    if ! restrict_physical_nodes; then
-      exit 1
-    fi
-    if ! pre_diablo_stability_gate identity-only-uhid; then
-      echo "[guided] ERROR: identity-only UHID + uinput readiness validation did not pass. The Diablo IV test will not continue."
-      printf 'no\n' >"$RUN_DIR/valid_diablo_test.txt"
-      printf 'identity-only UHID + uinput readiness validation failed\n' >"$RUN_DIR/v0.5_invalid_reason.txt"
-      stop_probe
-      restore_permissions || true
-      copy_summaries
-      finish_archive
-      exit 1
-    fi
-  elif [ "$full_monitor_status" = "clean" ]; then
-    startup_failed "uinput gameplay input validation did not pass"
-    exit 1
-  else
-    exit 1
+LAST_MODE="${MODE_ORDER[$((${#MODE_ORDER[@]} - 1))]}"
+for mode in "${MODE_ORDER[@]}"; do
+  if try_mode "$mode"; then
+    break
   fi
-fi
+  if [ "$mode" != "$LAST_MODE" ]; then
+    pause_for_enter "Mode $mode did not produce full success. Press Enter to try the next mode."
+  fi
+done
 
-printf 'yes\n' >"$RUN_DIR/valid_diablo_test.txt"
-printf '%s\n' "$SELECTED_RUNTIME_MODE" >"$RUN_DIR/selected_runtime_mode.txt"
-if [ "$SELECTED_RUNTIME_MODE" = "identity-only-uhid" ]; then
-  printf 'uinput\n' >"$RUN_DIR/selected_input_path.txt"
-  printf 'identity-only UHID + uinput ready\n' >"$RUN_DIR/diablo_test_allowed_reason.txt"
-else
-  printf 'uhid+uinput\n' >"$RUN_DIR/selected_input_path.txt"
-  printf 'full UHID input clean + uinput ready\n' >"$RUN_DIR/diablo_test_allowed_reason.txt"
-fi
-
-echo
-echo "Step 5:"
-echo "Before launching Diablo IV, open Steam Controller Tester for this controller."
-echo "Check whether Steam detects the controller, whether Steam Controller Tester shows a permanent touchpad contact, whether the touchpad looks idle/clean, and whether buttons/sticks respond."
-if ! wait_for_enter_while_probe_alive "Press Enter after you have checked Steam Controller Tester."; then
-  exit 1
-fi
-
-if ! ensure_probe_alive; then
-  exit 1
-fi
-
-ask_result "Steam detected controller" "steam_controller_detected.txt"
-ask_result "Steam Tester permanent touchpad contact" "steam_tester_permanent_touchpad_contact.txt"
-ask_result "Steam Tester touchpad looks idle/clean" "steam_tester_touchpad_idle_clean.txt"
-ask_result "Steam Tester buttons/sticks worked" "steam_tester_buttons_sticks_worked.txt"
-
-echo
-echo "Step 6:"
-echo "Now launch Steam, make sure Steam Input is disabled for Diablo IV, launch Diablo IV, and check whether PlayStation glyphs appear."
-if ! wait_for_enter_while_probe_alive "Press Enter after you have checked Diablo IV."; then
-  exit 1
-fi
-
-if ! ensure_probe_alive; then
-  exit 1
-fi
-
-ask_result "Did Diablo IV detect a controller?" "diablo_controller_detected.txt"
-ask_result "Did PlayStation glyphs appear?" "diablo_playstation_glyphs.txt"
-ask_result "Did input work?" "diablo_input_worked.txt"
-ask_result "Duplicate input?" "diablo_duplicate_input.txt"
-
-stop_probe
-restore_permissions || true
-copy_summaries
+choose_final_conclusion
 finish_archive
 
+echo "[guided] Final conclusion: $FINAL_CONCLUSION"
+echo "[guided] Selected final mode: $SELECTED_FINAL_MODE"
 echo "[guided] Done."

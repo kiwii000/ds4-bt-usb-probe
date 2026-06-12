@@ -143,6 +143,7 @@ mod linux {
     enum OutputMode {
         Both,
         UhidOnly,
+        UinputOnly,
     }
 
     impl OutputMode {
@@ -150,7 +151,16 @@ mod linux {
             match self {
                 Self::Both => "both",
                 Self::UhidOnly => "uhid",
+                Self::UinputOnly => "uinput",
             }
+        }
+
+        fn uhid_enabled(self) -> bool {
+            self != Self::UinputOnly
+        }
+
+        fn uinput_enabled(self) -> bool {
+            self != Self::UhidOnly
         }
     }
 
@@ -322,7 +332,11 @@ mod linux {
     fn run_device(config: Config) -> Result<(), AnyError> {
         install_signal_handlers();
         let capture_defaults = read_capture_defaults(&config.capture_root);
-        let descriptor = choose_descriptor(&config)?;
+        let descriptor = if config.output_mode.uhid_enabled() {
+            Some(choose_descriptor(&config)?)
+        } else {
+            None
+        };
         let name = config.name.clone().unwrap_or_else(|| SONY_DS4_NAME.to_string());
         let uhid_version = choose_uhid_version(config.version, capture_defaults.uhid_version);
         let uinput_version =
@@ -332,22 +346,18 @@ mod linux {
             version_source(config.uinput_version, capture_defaults.input_version);
         let status = Arc::new(StatusTracker::new(config.status_file.clone()));
         let touchpad_template = load_touchpad_template(&config);
-        status.set("probe_version", "0.5.2");
+        status.set("probe_version", "0.6.0");
         status.set("output_mode", config.output_mode.as_str());
         status.set("touchpad_mode", config.touchpad_mode.as_str());
         status.set("touchpad_template_source", &touchpad_template.source);
         status.set("uhid_identity_only", config.uhid_identity_only.to_string());
         status.set(
             "selected_runtime_mode",
-            if config.uhid_identity_only {
-                "identity-only-uhid"
-            } else {
-                "full-uhid-input"
-            },
+            runtime_mode_label(config.output_mode, config.uhid_identity_only),
         );
         status.set("uhid_ready", "false");
-        status.set("uinput_required", (config.output_mode == OutputMode::Both).to_string());
-        status.set("uinput_enabled", (config.output_mode == OutputMode::Both).to_string());
+        status.set("uinput_required", config.output_mode.uinput_enabled().to_string());
+        status.set("uinput_enabled", config.output_mode.uinput_enabled().to_string());
         status.set("uinput_ready", "false");
         status.set("bluetooth_ready", "false");
         status.set("bluetooth_reports_read", "0");
@@ -372,7 +382,40 @@ mod linux {
         status.set("uinput_vid", format!("0x{:04x}", config.vid));
         status.set("uinput_pid", format!("0x{:04x}", config.pid));
         status.set("virtual_name", &name);
-        status.set("descriptor_source", &descriptor.label);
+        status.set(
+            "descriptor_source",
+            descriptor
+                .as_ref()
+                .map(|choice| choice.label.as_str())
+                .unwrap_or("disabled: uinput-only mode"),
+        );
+
+        if !config.output_mode.uhid_enabled() {
+            if !config.bridge {
+                status.set("fatal_error", "uinput-only output requires bridge mode");
+                status.set("running", "false");
+                return Err(io::Error::other("uinput-only output requires bridge mode").into());
+            }
+            status.set("uhid_ready", "disabled");
+            status.set("uhid_error", "disabled by output mode");
+            let result = run_bridge(
+                None,
+                &config,
+                None,
+                touchpad_template,
+                uinput_version,
+                uinput_version_source,
+                &name,
+                &status,
+            );
+            if let Err(err) = &result {
+                status.set("fatal_error", err.to_string());
+            }
+            status.set("running", "false");
+            return result;
+        }
+
+        let descriptor = descriptor.expect("descriptor is selected when UHID is enabled");
         let features = Arc::new(FeatureReports::load(
             config.feature_root.as_deref(),
             config.bridge,
@@ -433,9 +476,9 @@ mod linux {
 
         let result = if config.bridge {
             run_bridge(
-                &mut device,
+                Some(&mut device),
                 &config,
-                report,
+                Some(report),
                 touchpad_template,
                 uinput_version,
                 uinput_version_source,
@@ -450,6 +493,16 @@ mod linux {
         }
         status.set("running", "false");
         result
+    }
+
+    fn runtime_mode_label(output_mode: OutputMode, uhid_identity_only: bool) -> &'static str {
+        match (output_mode, uhid_identity_only) {
+            (OutputMode::UinputOnly, _) => "uinput-only",
+            (OutputMode::Both, true) => "identity-only-uhid-plus-uinput",
+            (OutputMode::Both, false) => "full-uhid-plus-uinput",
+            (OutputMode::UhidOnly, true) => "identity-only-uhid",
+            (OutputMode::UhidOnly, false) => "full-uhid-only",
+        }
     }
 
     fn run_neutral_loop(
@@ -472,23 +525,23 @@ mod linux {
     }
 
     fn run_bridge(
-        device: &mut UhidDevice,
+        mut device: Option<&mut UhidDevice>,
         config: &Config,
-        neutral: [u8; 64],
+        neutral: Option<[u8; 64]>,
         touchpad_template: TouchpadTemplate,
         uinput_version: u32,
         uinput_version_source: &str,
         name: &str,
         status: &Arc<StatusTracker>,
     ) -> Result<(), AnyError> {
-        if config.output_mode == OutputMode::Both {
+        if config.output_mode.uinput_enabled() {
             println!(
                 "[uinput] requested identity: bus=USB/0x{BUS_USB:04x} vid=0x{:04x} pid=0x{:04x} version=0x{uinput_version:04x} name=\"{name}\"",
                 config.vid, config.pid
             );
             println!("[uinput] version source: {uinput_version_source}");
         }
-        let mut uinput = if config.output_mode == OutputMode::Both {
+        let mut uinput = if config.output_mode.uinput_enabled() {
             match UinputDevice::create(name, config.vid, config.pid, uinput_version) {
                 Ok(created) => {
                     status.set(
@@ -525,6 +578,7 @@ mod linux {
             }
         } else {
             println!("[uinput] disabled by output mode");
+            status.set("uinput_ready", "disabled");
             status.set("uinput_error", "disabled by output mode");
             None
         };
@@ -554,7 +608,10 @@ mod linux {
             events: libc::POLLIN,
             revents: 0,
         };
-        println!("[bridge] forwarding basic Bluetooth controls to virtual USB DS4");
+        println!(
+            "[bridge] forwarding basic Bluetooth controls with output_mode={}",
+            config.output_mode.as_str()
+        );
         println!("[bridge] READY: Bluetooth input stream opened");
         status.set("bluetooth_ready", "true");
 
@@ -610,8 +667,12 @@ mod linux {
             }
             if poll_result == 0 || pollfd.revents & libc::POLLIN == 0 {
                 if last_keepalive.elapsed() >= Duration::from_millis(config.interval_ms.max(4)) {
-                    send_checked_uhid_report(device, &neutral, status, "bridge-keepalive")?;
-                    status.increment("uhid_reports_emitted", 1);
+                    if let (Some(device), Some(neutral)) =
+                        (device.as_deref_mut(), neutral.as_ref())
+                    {
+                        send_checked_uhid_report(device, neutral, status, "bridge-keepalive")?;
+                        status.increment("uhid_reports_emitted", 1);
+                    }
                     last_keepalive = Instant::now();
                 }
                 continue;
@@ -623,6 +684,7 @@ mod linux {
                     match translate_bluetooth_report(&buffer[..size], &touchpad_template) {
                         Ok(translated) => {
                             if !config.uhid_identity_only {
+                                if let Some(device) = device.as_deref_mut() {
                                 send_checked_uhid_report(
                                     device,
                                     &translated.usb_report,
@@ -630,6 +692,7 @@ mod linux {
                                     "bridge-translated",
                                 )?;
                                 status.increment("uhid_reports_emitted", 1);
+                                }
                             }
                             if let Some(output) = uinput.as_mut() {
                                 let emitted =
@@ -666,7 +729,9 @@ mod linux {
                 Err(err) => return Err(err.into()),
             }
         }
-        device.destroy()?;
+        if let Some(device) = device.as_deref_mut() {
+            device.destroy()?;
+        }
         Ok(())
     }
 
@@ -1705,9 +1770,10 @@ mod linux {
                     config.output_mode = match next_value(&mut args, &arg)?.as_str() {
                         "both" => OutputMode::Both,
                         "uhid" | "uhid-only" => OutputMode::UhidOnly,
+                        "uinput" | "uinput-only" => OutputMode::UinputOnly,
                         value => {
                             return Err(io::Error::other(format!(
-                                "invalid --output-mode {value}; expected both or uhid"
+                                "invalid --output-mode {value}; expected both, uhid, or uinput"
                             ))
                             .into())
                         }
@@ -2431,11 +2497,11 @@ mod linux {
 
     fn print_help() {
         println!(
-            "ds4-bt-usb-probe 0.5.2
+            "ds4-bt-usb-probe 0.6.0
 
 Commands:
   ds4-bt-usb-probe [options]
-  ds4-bt-usb-probe bridge --output-mode <both|uhid> --status-file <path>
+  ds4-bt-usb-probe bridge --output-mode <both|uhid|uinput> --status-file <path>
   ds4-bt-usb-probe capture-features --hidraw <path> --output-dir <dir>
   ds4-bt-usb-probe capture-idle-input --hidraw <path> --output-dir <dir> [--duration-ms <n>]
   ds4-bt-usb-probe monitor-touchpad-events --event <path> --output-dir <dir> [--duration-ms <n>]
@@ -2625,6 +2691,52 @@ Commands:
             assert_eq!(gamepad_activity_event_label(&event), None);
             event = input_event(EV_KEY, BTN_TOUCH, 1);
             assert_eq!(gamepad_activity_event_label(&event), None);
+        }
+
+        #[test]
+        fn output_mode_parses_uinput_only() {
+            let command = parse_command(
+                [
+                    "bridge",
+                    "--output-mode",
+                    "uinput",
+                    "--status-file",
+                    "/tmp/status.txt",
+                ]
+                .into_iter()
+                .map(|value| value.to_string()),
+            )
+            .unwrap()
+            .unwrap();
+            let Command::Run(config) = command else {
+                panic!("expected run command");
+            };
+            assert_eq!(config.output_mode, OutputMode::UinputOnly);
+            assert!(!config.output_mode.uhid_enabled());
+            assert!(config.output_mode.uinput_enabled());
+            assert_eq!(runtime_mode_label(config.output_mode, false), "uinput-only");
+        }
+
+        #[test]
+        fn output_mode_flags_match_v06_runtime_modes() {
+            assert!(OutputMode::UhidOnly.uhid_enabled());
+            assert!(!OutputMode::UhidOnly.uinput_enabled());
+            assert!(OutputMode::Both.uhid_enabled());
+            assert!(OutputMode::Both.uinput_enabled());
+            assert!(!OutputMode::UinputOnly.uhid_enabled());
+            assert!(OutputMode::UinputOnly.uinput_enabled());
+            assert_eq!(
+                runtime_mode_label(OutputMode::UhidOnly, false),
+                "full-uhid-only"
+            );
+            assert_eq!(
+                runtime_mode_label(OutputMode::Both, false),
+                "full-uhid-plus-uinput"
+            );
+            assert_eq!(
+                runtime_mode_label(OutputMode::Both, true),
+                "identity-only-uhid-plus-uinput"
+            );
         }
 
         #[test]
